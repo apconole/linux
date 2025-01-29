@@ -165,12 +165,19 @@ static int get_dpifindex(const struct datapath *dp)
 static void destroy_dp_rcu(struct rcu_head *rcu)
 {
 	struct datapath *dp = container_of(rcu, struct datapath, rcu);
+	struct dp_sk_mnode *n, *cur;
 
 	ovs_flow_tbl_destroy(&dp->table);
 	free_percpu(dp->stats_percpu);
 	kfree(dp->ports);
 	ovs_meters_exit(dp);
 	kfree(rcu_dereference_raw(dp->upcall_portids));
+
+	list_for_each_entry_safe(cur, n, &dp->sock_list, list_node) {
+		sock_put(cur->output_sock);
+		kfree(cur);
+	}
+
 	kfree(dp);
 }
 
@@ -618,6 +625,7 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
 	struct sw_flow_actions *sf_acts;
 	struct datapath *dp;
 	struct vport *input_vport;
+
 	u16 mru = 0;
 	u64 hash;
 	int len;
@@ -644,6 +652,7 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
 		packet->ignore_df = 1;
 	}
 	OVS_CB(packet)->mru = mru;
+	OVS_CB(packet)->sk_map_data = NULL;
 
 	if (a[OVS_PACKET_ATTR_HASH]) {
 		hash = nla_get_u64(a[OVS_PACKET_ATTR_HASH]);
@@ -1891,6 +1900,8 @@ static int ovs_dp_cmd_new(struct sk_buff *skb, struct genl_info *info)
 
 	ovs_net = net_generic(ovs_dp_get_net(dp), ovs_net_id);
 	list_add_tail_rcu(&dp->list_node, &ovs_net->dps);
+
+	INIT_LIST_HEAD(&dp->sock_list);
 
 	ovs_unlock();
 

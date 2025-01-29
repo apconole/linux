@@ -495,6 +495,7 @@ u32 ovs_vport_find_upcall_portid(const struct vport *vport,
 int ovs_vport_receive(struct vport *vport, struct sk_buff *skb,
 		      const struct ip_tunnel_info *tun_info)
 {
+	struct ovs_skb_sk_map_data skmd = {};
 	struct sw_flow_key key;
 	int error;
 
@@ -503,6 +504,7 @@ int ovs_vport_receive(struct vport *vport, struct sk_buff *skb,
 	OVS_CB(skb)->cutlen = 0;
 	OVS_CB(skb)->probability = 0;
 	OVS_CB(skb)->upcall_pid = 0;
+	OVS_CB(skb)->sk_map_data = &skmd;
 	if (unlikely(dev_net(skb->dev) != ovs_dp_get_net(vport->dp))) {
 		u32 mark;
 

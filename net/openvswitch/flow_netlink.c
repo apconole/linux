@@ -65,6 +65,9 @@ static bool actions_may_change_flow(const struct nlattr *actions)
 		case OVS_ACTION_ATTR_USERSPACE:
 		case OVS_ACTION_ATTR_DROP:
 		case OVS_ACTION_ATTR_PSAMPLE:
+		case OVS_ACTION_ATTR_SOCK_TRY:
+		case OVS_ACTION_ATTR_MD_SOCK_TUPLE:
+		case OVS_ACTION_ATTR_ADD_SOCK:
 			break;
 
 		case OVS_ACTION_ATTR_CT:
@@ -2369,7 +2372,7 @@ static void ovs_nla_free_nested_actions(const struct nlattr *actions, int len)
 	/* Whenever new actions are added, the need to update this
 	 * function should be considered.
 	 */
-	BUILD_BUG_ON(OVS_ACTION_ATTR_MAX != 25);
+	BUILD_BUG_ON(OVS_ACTION_ATTR_MAX != 28);
 
 	if (!actions)
 		return;
@@ -3184,6 +3187,9 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
 			[OVS_ACTION_ATTR_DEC_TTL] = (u32)-1,
 			[OVS_ACTION_ATTR_DROP] = sizeof(u32),
 			[OVS_ACTION_ATTR_PSAMPLE] = (u32)-1,
+			[OVS_ACTION_ATTR_SOCK_TRY] = sizeof(u32),
+			[OVS_ACTION_ATTR_MD_SOCK_TUPLE] = 0,
+			[OVS_ACTION_ATTR_ADD_SOCK] = sizeof(u32),
 		};
 		const struct ovs_action_push_vlan *vlan;
 		int type = nla_type(a);
@@ -3466,6 +3472,15 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
 			err = validate_psample(a);
 			if (err)
 				return err;
+			break;
+
+		case OVS_ACTION_ATTR_SOCK_TRY:		fallthrough;
+		case OVS_ACTION_ATTR_MD_SOCK_TUPLE:
+			break;
+
+		case OVS_ACTION_ATTR_ADD_SOCK:
+			if (nla_get_u32(a) >= DP_MAX_PORTS)
+				return -EINVAL;
 			break;
 
 		default:

@@ -392,6 +392,9 @@ class ovsactions(nla):
         ("OVS_ACTION_ATTR_DEC_TTL", "none"),
         ("OVS_ACTION_ATTR_DROP", "uint32"),
         ("OVS_ACTION_ATTR_PSAMPLE", "psample"),
+        ("OVS_ACTION_ATTR_SOCK_TRY", "uint32"),
+        ("OVS_ACTION_ATTR_MD_SOCK_TUPLE", "flag"),
+        ("OVS_ACTION_ATTR_ADD_SOCK", "uint32"),
     )
 
     class psample(nla):
@@ -639,6 +642,13 @@ class ovsactions(nla):
                 print_str += "pop_nsh"
             elif field[0] == "OVS_ACTION_ATTR_POP_MPLS":
                 print_str += "pop_mpls"
+            elif field[0] == "OVS_ACTION_ATTR_MD_SOCK_TUPLE":
+                print_str += "sock(tuple)"
+            elif field[0] == "OVS_ACTION_ATTR_SOCK_TRY":
+                print_str += "sock(try,recirc=%d)" % \
+                    int(self.get_attr(field[0]))
+            elif field[0] == "OVS_ACTION_ATTR_ADD_SOCK":
+                print_str += "sock(commit,%d)" % int(self.get_attr(field[0]))
             else:
                 datum = self.get_attr(field[0])
                 if field[0] == "OVS_ACTION_ATTR_CLONE":
@@ -877,6 +887,36 @@ class ovsactions(nla):
                 )
                 self["attrs"].append(["OVS_ACTION_ATTR_TRUNC", val])
                 parsed = True
+
+            elif parse_starts_block(actstr, "sock(", False):
+                parencount += 1
+                actstr = actstr[5:]
+                if actstr.startswith("try,"):
+                    actstr = actstr[4:]
+                    actstr, val = parse_extract_field(
+                        actstr,
+                        "recirc=",
+                        r"([0-9a-fA-Fx]+)",
+                        lambda x: int(x, 0),
+                        False)
+                    if val is not None:
+                        self["attrs"].append(["OVS_ACTION_ATTR_SOCK_TRY", val])
+                        parsed = True
+                elif actstr.startswith("tuple"):
+                    actstr = actstr[5:]
+                    parsed = True
+                    self["attrs"].append(["OVS_ACTION_ATTR_MD_SOCK_TUPLE",
+                                          True])
+                elif actstr.startswith("commit,"):
+                    actstr, val = parse_extract_field(
+                        actstr,
+                        "commit,",
+                        r"([0-9]+)",
+                        int,
+                        False)
+                    if val is not None:
+                        self["attrs"].append(["OVS_ACTION_ATTR_ADD_SOCK", val])
+                        parsed = True
 
             actstr = actstr[strspn(actstr, ", ") :]
             while parencount > 0:

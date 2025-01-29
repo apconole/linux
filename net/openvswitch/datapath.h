@@ -67,6 +67,50 @@ struct dp_nlsk_pids {
 	u32 pids[];
 };
 
+enum ovs_sk_map_key_select {
+	OVS_SK_MAP_KEY_UNSET,
+	OVS_SK_MAP_KEY_INPUT_SOCKET_BASED,
+	OVS_SK_MAP_KEY_TUPLE_BASED,
+
+	OVS_SK_MAP_KEY_MAX__
+};
+
+/**
+ * struct ovs_skb_sk_map_data - OVS SK Map lookup data
+ * @key_type: Select whether to use input_socket based map or use the 5-tuple.
+ * @key: Union of input_socket vs 5-tuple.
+ */
+struct ovs_skb_sk_map_data {
+	enum ovs_sk_map_key_select key_type;
+	union {
+		struct sock *input_socket;
+		struct {
+			union {
+				struct {
+					__be32 src;	/* IP4 source address. */
+					__be32 dst;	/* IP4 destination address. */
+				} ipv4;
+				struct {
+					struct in6_addr src;	/* IP6 source address. */
+					struct in6_addr dst;	/* IP6 destination address. */
+					__be32 label;		/* IP6 flow label. */
+				} ipv6;
+			} ip;
+			struct {
+				__be16 src;	/* TCP/UDP/SCTP src port. */
+				__be16 dst;	/* TCP/UDP/SCTP dst port. */
+			} tp;
+			u8 protocol;		/* IPPROTO_*. */
+		} tuple;
+	} key;
+};
+
+struct dp_sk_mnode {
+	struct list_head		list_node;
+	struct ovs_skb_sk_map_data	key;
+	struct sock			*output_sock;
+};
+
 /**
  * struct datapath - datapath for flow-based packet switching
  * @rcu: RCU callback head for deferred destruction.
@@ -109,6 +153,9 @@ struct datapath {
 	struct dp_meter_table meter_tbl;
 
 	struct dp_nlsk_pids __rcu *upcall_portids;
+
+	/* Socket list */
+	struct list_head sock_list;
 };
 
 /**
@@ -123,6 +170,8 @@ struct datapath {
  * no sampling has occurred; U32_MAX means 100% probability.
  * @upcall_pid: Netlink socket PID to use for sending this packet to userspace;
  * 0 means "not set" and default per-CPU or per-vport dispatch should be used.
+ * @sk_map_data: The tuples and other information used to interact with the
+ * current datapath's skmap; only populated after a metadata load is called.
  */
 struct ovs_skb_cb {
 	struct vport		*input_vport;
@@ -131,6 +180,7 @@ struct ovs_skb_cb {
 	u32			cutlen;
 	u32			probability;
 	u32			upcall_pid;
+	struct ovs_skb_sk_map_data *sk_map_data;
 };
 #define OVS_CB(skb) ((struct ovs_skb_cb *)(skb)->cb)
 

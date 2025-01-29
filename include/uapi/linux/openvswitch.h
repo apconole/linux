@@ -1039,7 +1039,18 @@ enum ovs_action_attr {
 	OVS_ACTION_ATTR_DEC_TTL,      /* Nested OVS_DEC_TTL_ATTR_*. */
 	OVS_ACTION_ATTR_DROP,         /* u32 error code. */
 	OVS_ACTION_ATTR_PSAMPLE,      /* Nested OVS_PSAMPLE_ATTR_*. */
-
+	OVS_ACTION_ATTR_SOCK_TRY,     /* Attempt to find a socket in the map.
+				       * If an appropriate socket is found,
+				       * then the packet is forwarded and the
+				       * pipeline ends.  Otherwise, jump to
+				       * u32 recirc id. */
+	OVS_ACTION_ATTR_MD_SOCK_TUPLE, /* Sets the socket map criteria to use
+					* the key's 5-tuple details. */
+	OVS_ACTION_ATTR_ADD_SOCK,     /* Looks at the port specified by u32,
+				       * and if possible tries to find a socket.  If
+				       * found, take a reference to the socket, and
+				       * populate the map with the last loaded sock
+				       *  tuple as a key, and the socket as value */
 	__OVS_ACTION_ATTR_MAX,	      /* Nothing past this will be accepted
 				       * from userspace. */
 

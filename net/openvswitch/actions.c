@@ -15,6 +15,7 @@
 #include <linux/in6.h>
 #include <linux/if_arp.h>
 #include <linux/if_vlan.h>
+#include <linux/snmp.h>
 
 #include <net/dst.h>
 #include <net/gso.h>
@@ -24,6 +25,9 @@
 #include <net/checksum.h>
 #include <net/dsfield.h>
 #include <net/mpls.h>
+#include <net/tcp.h>
+#include <net/sock.h>
+#include <net/snmp.h>
 
 #if IS_ENABLED(CONFIG_PSAMPLE)
 #include <net/psample.h>
@@ -1246,6 +1250,303 @@ static void execute_psample(struct datapath *dp, struct sk_buff *skb,
 {}
 #endif
 
+static int ovs_cmp_sock_md(struct ovs_skb_sk_map_data *key,
+			   struct ovs_skb_sk_map_data *cmp) {
+	return (key && cmp && key->key_type == cmp->key_type &&
+		(key->key_type != OVS_SK_MAP_KEY_UNSET) &&
+		((key->key_type == OVS_SK_MAP_KEY_INPUT_SOCKET_BASED &&
+		  key->key.input_socket == cmp->key.input_socket) ||
+		 (key->key_type == OVS_SK_MAP_KEY_TUPLE_BASED &&
+		  key->key.tuple.ip.ipv4.src == cmp->key.tuple.ip.ipv4.src &&
+		  key->key.tuple.ip.ipv4.dst == cmp->key.tuple.ip.ipv4.dst &&
+		  key->key.tuple.tp.src == cmp->key.tuple.tp.src &&
+		  key->key.tuple.tp.dst == cmp->key.tuple.tp.dst &&
+		  key->key.tuple.protocol == cmp->key.tuple.protocol)));
+}
+
+static bool ovs_skbuff_validate_for_sockmap(struct sk_buff *skb, unsigned int *hlen)
+{
+	unsigned int header_len;
+	struct ethhdr *eth;
+	struct tcphdr *tcp;
+	struct iphdr *ip;
+
+	if (!skb || skb->len <= sizeof(struct ethhdr))
+		return false;
+
+	eth = eth_hdr(skb);
+	if (!eth)
+		return false;
+
+	if (eth->h_proto != htons(ETH_P_IP))
+		return false;
+
+	ip = ip_hdr(skb);
+	if (!ip || skb->len <= sizeof(struct ethhdr) + ip->ihl * 4)
+		return false;
+
+	if (ip->protocol != IPPROTO_TCP)
+		return false;
+
+	tcp = tcp_hdr(skb);
+	if (!tcp || skb->len <= sizeof(struct ethhdr) + ip->ihl * 4 + tcp->doff * 4)
+		return false;
+
+	header_len = sizeof(struct ethhdr) + ip->ihl * 4 + tcp->doff * 4;
+	if (hlen)
+		*hlen = header_len;
+
+	return true;
+}
+
+#if 0
+/* Insert skb into rb tree, ordered by TCP_SKB_CB(skb)->seq */
+static void ovs_tcp_rbtree_insert(struct rb_root *root, struct sk_buff *skb)
+{
+	struct rb_node **p = &root->rb_node;
+	struct rb_node *parent = NULL;
+	struct sk_buff *skb1;
+
+	while (*p) {
+		parent = *p;
+		skb1 = rb_to_skb(parent);
+		if (before(TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb1)->seq))
+			p = &parent->rb_left;
+		else
+			p = &parent->rb_right;
+	}
+	rb_link_node(&skb->rbnode, parent, p);
+	rb_insert_color(&skb->rbnode, root);
+}
+#endif
+
+static int enqueue_skb_to_tcp_socket(struct sock *sk, struct sk_buff *skb)
+{
+	size_t skb_doff = skb_transport_offset(skb), oiif;
+	struct tcphdr *tcph = tcp_hdr(skb);
+	struct iphdr *iph = ip_hdr(skb);
+	struct ovs_skb_cb oskb;
+	int ret = 0;
+
+	memcpy(&oskb, OVS_CB(skb), sizeof oskb);
+
+	/* Setup for processing the TCP details */
+	skb_pull(skb, skb_doff);
+
+	IP_INC_STATS(sock_net(sk), IPSTATS_MIB_INPKTS);
+	TCP_INC_STATS(sock_net(sk), TCP_MIB_INSEGS);
+
+	/* Initialize TCP_SKB_CB(skb)->header.h4 to null */
+	memset(&TCP_SKB_CB(skb)->header.h4, 0,
+	       sizeof(TCP_SKB_CB(skb)->header.h4));
+
+	TCP_SKB_CB(skb)->seq = ntohl(tcph->seq);
+	TCP_SKB_CB(skb)->end_seq = (TCP_SKB_CB(skb)->seq + tcph->syn +
+				    tcph->fin + skb->len - tcph->doff * 4);
+	TCP_SKB_CB(skb)->ack_seq = ntohl(tcph->ack_seq);
+	TCP_SKB_CB(skb)->tcp_flags = tcp_flag_word(tcph);
+	TCP_SKB_CB(skb)->sacked = 0;  /* Clear SACK state */
+	TCP_SKB_CB(skb)->ip_dsfield = ipv4_get_dsfield(iph);
+	TCP_SKB_CB(skb)->has_rxtstamp = skb->tstamp ||
+	  skb_hwtstamps(skb)->hwtstamp;
+	oiif = skb->skb_iif;
+	bh_lock_sock_nested(sk);
+	tcp_segs_in(tcp_sk(sk), skb);
+	skb->skb_iif = sk->sk_rx_dst_ifindex;
+	TCP_SKB_CB(skb)->header.h4.iif = sk->sk_rx_dst_ifindex;
+	ret = 0;
+	if (!sock_owned_by_user(sk)) {
+		ret = tcp_v4_do_rcv(sk, skb);
+	} else {
+		enum skb_drop_reason drop_reason;
+		if (tcp_add_backlog(sk, skb, &drop_reason)) {
+			ret = -EAGAIN;
+			skb->skb_iif = oiif;
+			skb_push(skb, skb_doff);
+			memcpy(OVS_CB(skb), &oskb, sizeof oskb);
+			goto tcp_add_done;
+		}
+	}
+tcp_add_done:
+	bh_unlock_sock(sk);
+	return ret;
+}
+
+static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
+			    struct sw_flow_key *key,
+			    const struct nlattr *a, bool last)
+{
+	struct dp_sk_mnode *n;
+	u32 recirc_id;
+
+	if (unlikely(!OVS_CB(skb)->sk_map_data) ||
+	    OVS_CB(skb)->sk_map_data->key_type == OVS_SK_MAP_KEY_UNSET) {
+		net_warn_ratelimited("Attempt to use ovs sk_map without a valid tuple.\n");
+		goto recirc_action;
+	}
+
+	list_for_each_entry(n, &dp->sock_list, list_node) {
+		if (ovs_cmp_sock_md(&n->key, OVS_CB(skb)->sk_map_data)) {
+			struct sock *sk = n->output_sock;
+			unsigned int pull_len = 0;
+			int ret;
+
+			if (!sk || (sk->sk_state != TCP_ESTABLISHED) ||
+			    !ovs_skbuff_validate_for_sockmap(skb, &pull_len) ||
+			    (skb->pkt_type != PACKET_HOST &&
+			     skb->pkt_type != PACKET_OTHERHOST)) {
+				goto recirc_action;
+			}
+
+			ret = enqueue_skb_to_tcp_socket(sk, skb);
+			if (ret == -EAGAIN)
+				goto recirc_action;
+
+			return ret;
+		}
+	}
+
+ recirc_action:
+	recirc_id = nla_get_u32(a);
+	return clone_execute(dp, skb, key, recirc_id, NULL, 0, last, true);
+}
+
+static struct sock *get_socket(struct net *net, __be32 saddr, __be16 sport,
+			       __be32 daddr, __be16 dport, u32 idx, bool ref)
+{
+	struct sock *sk = NULL;
+	struct inet_hashinfo *hashinfo = &tcp_hashinfo;
+	spinlock_t *lock;
+	u32 hash;
+
+	hash = inet_ehashfn(net, daddr, dport, saddr, sport);
+	lock = inet_ehash_lockp(hashinfo, hash);
+
+	spin_lock_bh(lock);
+	sk = __inet_lookup_established(net, hashinfo, saddr, sport, daddr,
+				       dport, idx, 0);
+	/* take a reference to the socket while under the lock. */
+	if (sk && sk->sk_state == TCP_ESTABLISHED && ref)
+		sock_hold(sk);
+	else
+		sk = NULL;
+	spin_unlock_bh(lock);
+
+	/* At this point the caller has a valid reference to the socket. */
+	return sk && sk->sk_state == TCP_ESTABLISHED ? sk : NULL;
+}
+
+static int execute_ovs_sk_map_metadata(struct sk_buff *skb,
+				       struct sw_flow_key *key)
+{
+	struct ovs_skb_sk_map_data *skmd = OVS_CB(skb)->sk_map_data;
+
+	/* for now, only ipv4 tcp - more to follow */
+	if (key->ip.proto != IPPROTO_TCP || skb->protocol != htons(ETH_P_IP))
+		return 0;
+
+	/* Never override the input socket mapping, as it is the
+	 * preferred key. */
+	if (skmd->key_type == OVS_SK_MAP_KEY_INPUT_SOCKET_BASED &&
+	    skmd->key.input_socket) {
+		return 0;
+	}
+
+#if 0
+	/* PoC: Just do ipv4, but this needs to expand for a real solution. */
+	if (skmd->key_type == OVS_SK_MAP_KEY_UNSET &&
+	    in_port->dev->rtnl_link_ops &&
+	    in_port->dev->rtnl_link_ops->get_link_net) {
+		struct sock *sk;
+		struct net *ns;
+		u32 ifindex;
+
+		ns = in_port->dev->rtnl_link_ops->get_link_net(in_port->dev);
+		ifindex = inet_iif(skb);
+
+		/* We swap src/dst when lookup input side. */
+		sk = get_socket(ns,
+				key->ipv4.addr.dst, key->tp.dst,
+				key->ipv4.addr.src, htons(key->tp.src),
+				ifindex, false);
+		if (sk) {
+			skmd->key_type = OVS_SK_MAP_KEY_INPUT_SOCKET_BASED;
+			skmd->key.input_socket = sk;
+			return 0;
+		}
+	}
+#endif
+
+	skmd->key_type = OVS_SK_MAP_KEY_TUPLE_BASED;
+	skmd->key.tuple.ip.ipv4.src = key->ipv4.addr.src;
+	skmd->key.tuple.ip.ipv4.dst = key->ipv4.addr.dst;
+	skmd->key.tuple.tp.src = key->tp.src;
+	skmd->key.tuple.tp.dst = key->tp.dst;
+	skmd->key.tuple.protocol = key->ip.proto;
+	return 0;
+}
+
+/* lookup a socket in the output port specified by 'port'.  If found, use
+ * the metadata as a key to insert into the list. */
+static int execute_ovs_add_sock(struct datapath *dp, struct sk_buff *skb,
+				struct sw_flow_key *key,
+				u32 port)
+{
+	struct ovs_skb_sk_map_data *skmd = OVS_CB(skb)->sk_map_data;
+	struct vport *vport = ovs_vport_rcu(dp, port);
+	struct sock *sock = NULL;
+
+	if (!skmd) {
+		return -EINVAL;
+	}
+
+	if (likely(vport && netif_running(vport->dev) &&
+		   netif_carrier_ok(vport->dev)) &&
+	    vport->dev->rtnl_link_ops &&
+	    vport->dev->rtnl_link_ops->get_link_net) {
+		struct net *ns;
+		u32 ifindex;
+
+		ns = vport->dev->rtnl_link_ops->get_link_net(vport->dev);
+		ifindex = inet_sdif(skb);
+		sock = get_socket(ns,
+				  key->ipv4.addr.src, key->tp.src,
+				  key->ipv4.addr.dst, htons(key->tp.dst),
+				  ifindex, true);
+	}
+
+	if (sock) {
+		struct dp_sk_mnode *node;
+		struct dp_sk_mnode *n;
+
+		list_for_each_entry(n, &dp->sock_list, list_node) {
+			if (ovs_cmp_sock_md(&n->key,
+					    OVS_CB(skb)->sk_map_data)) {
+				/* get_socket above took a ref, so must
+				 * actually close it here.
+				 */
+				sock_put(sock);
+				return 0;
+			}
+		}
+
+		node = kzalloc(sizeof(*node), GFP_ATOMIC);
+		if (!node) {
+			/* get_socket above took a ref, so must actually close
+			 * it here.
+			 */
+			sock_put(sock);
+			return -ENOMEM;
+		}
+
+		node->key = *OVS_CB(skb)->sk_map_data;
+		node->output_sock = sock;
+		list_add(&node->list_node, &dp->sock_list);
+	}
+
+	return 0;
+}
+
 /* Execute a list of actions against 'skb'. */
 static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 			      struct sw_flow_key *key,
@@ -1458,8 +1759,29 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
 				return 0;
 			}
 			break;
+
+		case OVS_ACTION_ATTR_SOCK_TRY: {
+			bool last = nla_is_last(a, rem);
+
+			err = execute_sock_try(dp, skb, key, a, last);
+			if (last) {
+				/* If this is the last action, the skb has
+				 * been consumed or freed.
+				 * Return immediately.
+				 */
+				return err;
+			}
+			break;
 		}
 
+		case OVS_ACTION_ATTR_MD_SOCK_TUPLE:
+			err = execute_ovs_sk_map_metadata(skb, key);
+			break;
+
+		case OVS_ACTION_ATTR_ADD_SOCK:
+			err = execute_ovs_add_sock(dp, skb, key, nla_get_u32(a));
+			break;
+		}
 		if (unlikely(err)) {
 			ovs_kfree_skb_reason(skb, OVS_DROP_ACTION_ERROR);
 			return err;
