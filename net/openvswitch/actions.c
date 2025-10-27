@@ -15,6 +15,7 @@
 #include <linux/in6.h>
 #include <linux/if_arp.h>
 #include <linux/if_vlan.h>
+#include <linux/snmp.h>
 
 #include <net/dst.h>
 #include <net/gso.h>
@@ -24,6 +25,9 @@
 #include <net/checksum.h>
 #include <net/dsfield.h>
 #include <net/mpls.h>
+#include <net/snmp.h>
+#include <net/sock.h>
+#include <net/tcp.h>
 
 #if IS_ENABLED(CONFIG_PSAMPLE)
 #include <net/psample.h>
@@ -1311,6 +1315,95 @@ static void execute_psample(struct datapath *dp, struct sk_buff *skb,
 			    const struct nlattr *attr)
 {}
 #endif
+
+static bool ovs_skbuff_validate_for_socket(struct sk_buff *skb, unsigned int *hlen)
+{
+	unsigned int header_len;
+	struct ethhdr *eth;
+	struct tcphdr *tcp;
+	struct iphdr *ip;
+
+	if (!skb || skb->len <= sizeof(struct ethhdr))
+		return false;
+
+	eth = eth_hdr(skb);
+	if (!eth)
+		return false;
+
+	if (eth->h_proto != htons(ETH_P_IP))
+		return false;
+
+	ip = ip_hdr(skb);
+	if (!ip || skb->len <= sizeof(struct ethhdr) + ip->ihl * 4)
+		return false;
+
+	if (ip->protocol != IPPROTO_TCP)
+		return false;
+
+	tcp = tcp_hdr(skb);
+	if (!tcp ||
+	    skb->len <= sizeof(struct ethhdr) + ip->ihl * 4 + tcp->doff * 4)
+		return false;
+
+	header_len = sizeof(struct ethhdr) + ip->ihl * 4 + tcp->doff * 4;
+	if (hlen)
+		*hlen = header_len;
+
+	return true;
+}
+
+static int enqueue_skb_to_tcp_socket(struct sock *sk, struct sk_buff *skb)
+{
+	size_t skb_doff = skb_transport_offset(skb), oiif;
+	struct tcphdr *tcph = tcp_hdr(skb);
+	struct iphdr *iph = ip_hdr(skb);
+	struct ovs_skb_cb oskb;
+	int ret = 0;
+
+	memcpy(&oskb, OVS_CB(skb), sizeof(oskb));
+
+	/* Setup for processing the TCP details */
+	skb_pull(skb, skb_doff);
+
+	IP_INC_STATS(sock_net(sk), IPSTATS_MIB_INPKTS);
+	TCP_INC_STATS(sock_net(sk), TCP_MIB_INSEGS);
+
+	/* Initialize TCP_SKB_CB(skb)->header.h4 to null */
+	memset(&TCP_SKB_CB(skb)->header.h4, 0,
+	       sizeof(TCP_SKB_CB(skb)->header.h4));
+
+	TCP_SKB_CB(skb)->seq = ntohl(tcph->seq);
+	TCP_SKB_CB(skb)->end_seq = (TCP_SKB_CB(skb)->seq + tcph->syn +
+				    tcph->fin + skb->len - tcph->doff * 4);
+	TCP_SKB_CB(skb)->ack_seq = ntohl(tcph->ack_seq);
+	TCP_SKB_CB(skb)->tcp_flags = tcp_flag_word(tcph);
+	TCP_SKB_CB(skb)->sacked = 0;  /* Clear SACK state */
+	TCP_SKB_CB(skb)->ip_dsfield = ipv4_get_dsfield(iph);
+	TCP_SKB_CB(skb)->has_rxtstamp = skb->tstamp ||
+	  skb_hwtstamps(skb)->hwtstamp;
+	oiif = skb->skb_iif;
+	bh_lock_sock_nested(sk);
+	tcp_segs_in(tcp_sk(sk), skb);
+	skb->skb_iif = sk->sk_rx_dst_ifindex;
+	TCP_SKB_CB(skb)->header.h4.iif = sk->sk_rx_dst_ifindex;
+	ret = 0;
+	if (!sock_owned_by_user(sk)) {
+		ret = tcp_v4_do_rcv(sk, skb);
+	} else {
+		enum skb_drop_reason drop_reason;
+
+		if (tcp_add_backlog(sk, skb, &drop_reason)) {
+			ret = -EAGAIN;
+			skb->skb_iif = oiif;
+			skb_push(skb, skb_doff);
+			memcpy(OVS_CB(skb), &oskb, sizeof(oskb));
+			goto tcp_add_done;
+		}
+	}
+tcp_add_done:
+	bh_unlock_sock(sk);
+	return ret;
+}
 
 /* Execute a list of actions against 'skb'. */
 static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,

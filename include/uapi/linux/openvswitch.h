@@ -1039,6 +1039,7 @@ enum ovs_action_attr {
 	OVS_ACTION_ATTR_DEC_TTL,      /* Nested OVS_DEC_TTL_ATTR_*. */
 	OVS_ACTION_ATTR_DROP,         /* u32 error code. */
 	OVS_ACTION_ATTR_PSAMPLE,      /* Nested OVS_PSAMPLE_ATTR_*. */
+	OVS_ACTION_ATTR_SOCKET,       /* Nested OVS_SOCKET_ATTR_*. */
 
 	__OVS_ACTION_ATTR_MAX,	      /* Nothing past this will be accepted
 				       * from userspace. */
@@ -1139,4 +1140,40 @@ enum ovs_dec_ttl_attr {
 
 #define OVS_DEC_TTL_ATTR_MAX (__OVS_DEC_TTL_ATTR_MAX - 1)
 
+enum ovs_socket_action_attr {
+	OVS_SOCKET_ACTION_ATTR_UNSPEC,
+	OVS_SOCKET_ACTION_ATTR_NETNS_ID,
+	OVS_SOCKET_ACTION_ATTR_INODE,
+	OVS_SOCKET_ACTION_ATTR_PROTO,
+	OVS_SOCKET_ACTION_ATTR_SRC_V4,
+	OVS_SOCKET_ACTION_ATTR_SRC_V6,
+	OVS_SOCKET_ACTION_ATTR_DST_V4,
+	OVS_SOCKET_ACTION_ATTR_DST_V6,
+	OVS_SOCKET_ACTION_ATTR_SPORT,
+	OVS_SOCKET_ACTION_ATTR_DPORT,
+	OVS_SOCKET_ACTION_ATTR_ACTIONS,
+
+	__OVS_SOCKET_ACTION_ATTR_MAX,
+
+#ifdef __KERNEL__
+	OVS_SOCKET_ACTION_ATTR_ARG
+#endif
+};
+
+#define OVS_SOCKET_ACTION_ATTR_MAX (__OVS_SOCKET_ACTION_ATTR_MAX - 1)
+
+#ifdef __KERNEL__
+struct sock;
+
+struct socket_action_arg {
+	__u32 netns_id;
+	__u64 socket_inode;
+	__u8 proto;
+	__be32 ipv4_src;
+	__be32 ipv4_dst;
+	__be16 sport;
+	__be16 dport;
+	struct sock *output_socket;
+};
+#endif /* __KERNEL__ */
 #endif /* _LINUX_OPENVSWITCH_H */

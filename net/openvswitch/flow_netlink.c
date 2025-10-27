@@ -30,6 +30,7 @@
 #include <linux/icmpv6.h>
 #include <linux/rculist.h>
 #include <net/geneve.h>
+#include <net/inet_hashtables.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
 #include <net/ndisc.h>
@@ -65,6 +66,7 @@ static bool actions_may_change_flow(const struct nlattr *actions)
 		case OVS_ACTION_ATTR_USERSPACE:
 		case OVS_ACTION_ATTR_DROP:
 		case OVS_ACTION_ATTR_PSAMPLE:
+		case OVS_ACTION_ATTR_SOCKET:
 			break;
 
 		case OVS_ACTION_ATTR_CT:
@@ -2398,6 +2400,28 @@ static void ovs_nla_free_set_action(const struct nlattr *a)
 	}
 }
 
+static void ovs_nla_free_socket_action(const struct nlattr *action)
+{
+	const struct nlattr *a;
+	int rem;
+
+	nla_for_each_nested(a, action, rem) {
+		switch (nla_type(a)) {
+		case OVS_SOCKET_ACTION_ATTR_ARG: {
+			struct socket_action_arg *arg = nla_data(a);
+			if (arg->output_socket) {
+				sock_put(arg->output_socket);
+				arg->output_socket = NULL;
+			}
+			break;
+		}
+		case OVS_SOCKET_ACTION_ATTR_ACTIONS:
+			ovs_nla_free_nested_actions(nla_data(a), nla_len(a));
+			break;
+		}
+	}
+}
+
 static void ovs_nla_free_nested_actions(const struct nlattr *actions, int len)
 {
 	const struct nlattr *a;
@@ -2406,7 +2430,7 @@ static void ovs_nla_free_nested_actions(const struct nlattr *actions, int len)
 	/* Whenever new actions are added, the need to update this
 	 * function should be considered.
 	 */
-	BUILD_BUG_ON(OVS_ACTION_ATTR_MAX != 25);
+	BUILD_BUG_ON(OVS_ACTION_ATTR_MAX != 26);
 
 	if (!actions)
 		return;
@@ -2435,6 +2459,10 @@ static void ovs_nla_free_nested_actions(const struct nlattr *actions, int len)
 
 		case OVS_ACTION_ATTR_SET:
 			ovs_nla_free_set_action(a);
+			break;
+
+		case OVS_ACTION_ATTR_SOCKET:
+			ovs_nla_free_socket_action(a);
 			break;
 		}
 	}
@@ -3169,6 +3197,145 @@ static int validate_psample(const struct nlattr *attr)
 	return a[OVS_PSAMPLE_ATTR_GROUP] ? 0 : -EINVAL;
 }
 
+static struct net *find_net_by_id(int netns_id)
+{
+	struct net *net, *ret;
+
+	for_each_net(net) {
+		if (net->ns.inum != netns_id)
+			continue;
+
+		ret = net;
+	}
+
+	return ret;
+}
+
+static struct sock *find_socket_by_inode(struct net *netns, uint64_t inode_id)
+{
+	struct inet_hashinfo *hinfo = netns->ipv4.tcp_death_row.hashinfo;
+	struct sock *sk, *ret = NULL;
+	int i;
+
+	for (i = 0; i <= hinfo->ehash_mask && !ret; i++) {
+		struct hlist_nulls_node *node;
+		struct inet_ehash_bucket *head = &hinfo->ehash[i];
+		spinlock_t *lock = &hinfo->ehash_locks[i];
+		spin_lock_bh(lock);
+		sk_nulls_for_each(sk, node, &head->chain) {
+			struct socket *sock = sk->sk_socket;
+			struct inode *inode;
+			struct file *file;
+
+			if (!sock)
+				continue;
+
+			file = sock->file;
+			if (!file)
+				continue;
+
+			inode = file->f_inode;
+			if (!inode)
+				continue;
+
+			if (inode->i_ino == inode_id) {
+				ret = sk;
+				sock_hold(ret);
+				break;
+			}
+		}
+		spin_unlock_bh(lock);
+	}
+
+	return ret;
+}
+
+static int validate_and_copy_socket_action(struct net *net,
+					   const struct nlattr *attr,
+					   const struct sw_flow_key *key,
+					   struct sw_flow_actions **sfa,
+					   __be16 eth_type, __be16 vlan_tci,
+					   u32 mpls_label_count,
+					   bool log, bool last, u32 depth)
+{
+	static const struct nla_policy policy[OVS_SOCKET_ACTION_ATTR_MAX + 1] = {
+		[OVS_SOCKET_ACTION_ATTR_NETNS_ID] = { .type = NLA_U32 },
+		[OVS_SOCKET_ACTION_ATTR_INODE] = { .type = NLA_U64 },
+		[OVS_SOCKET_ACTION_ATTR_ACTIONS] = { .type = NLA_NESTED },
+	};
+	struct nlattr *a[OVS_SOCKET_ACTION_ATTR_MAX + 1];
+	const struct nlattr *acts_if_missing;
+	struct socket_action_arg arg;
+	uint64_t socket_inode = 0;
+	struct sock *sk = NULL;
+	uint32_t netns_id = 0;
+	int nested_acts_start;
+	int start, err;
+
+	err = nla_parse_nested(a, OVS_SOCKET_ACTION_ATTR_MAX, attr, policy,
+			       NULL);
+	if (err)
+		return err;
+
+	if (!a[OVS_SOCKET_ACTION_ATTR_NETNS_ID])
+		return EINVAL;
+
+	netns_id = nla_get_u32(a[OVS_SOCKET_ACTION_ATTR_NETNS_ID]);
+
+	/* Look up the socket object. */
+	if (a[OVS_SOCKET_ACTION_ATTR_INODE])
+		socket_inode = nla_get_u64(a[OVS_SOCKET_ACTION_ATTR_INODE]);
+
+	if (netns_id && socket_inode) {
+		struct net *target_net = find_net_by_id(netns_id);
+		sk = find_socket_by_inode(target_net, socket_inode);
+		if (!sk) {
+			err = EINVAL;
+			goto release;
+		}
+	}
+
+	acts_if_missing = a[OVS_SOCKET_ACTION_ATTR_ACTIONS];
+
+	start = add_nested_action_start(sfa, OVS_ACTION_ATTR_SOCKET,
+					log);
+	if (start < 0) {
+		err = start;
+		goto release;
+	}
+
+	arg.output_socket = sk;
+	arg.netns_id = netns_id;
+	arg.socket_inode = socket_inode;
+	err = ovs_nla_add_action(sfa, OVS_SOCKET_ACTION_ATTR_ARG, &arg,
+				 sizeof(arg), log);
+	if (err)
+		goto release;
+
+
+	nested_acts_start = add_nested_action_start(sfa,
+	        OVS_SOCKET_ACTION_ATTR_ACTIONS, log);
+	if (nested_acts_start < 0) {
+		err = nested_acts_start;
+		goto release;
+	}
+
+	err = __ovs_nla_copy_actions(net, acts_if_missing, key,
+				     sfa, eth_type, vlan_tci, mpls_label_count,
+				     log, depth + 1);
+	if (err)
+		goto release;
+
+	add_nested_action_end(*sfa, nested_acts_start);
+	add_nested_action_end(*sfa, start);
+	return 0;
+
+release:
+	if (sk)
+		sock_put(sk);
+	return err;
+}
+
 static int copy_action(const struct nlattr *from,
 		       struct sw_flow_actions **sfa, bool log)
 {
@@ -3508,6 +3675,20 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
 			if (err)
 				return err;
 			break;
+		case OVS_ACTION_ATTR_SOCKET: {
+			bool last = nla_is_last(a, rem);
+
+			err = validate_and_copy_socket_action(net, a, key, sfa,
+							      eth_type,
+							      vlan_tci,
+							      mpls_label_count,
+							      log, last,
+							      depth);
+			if (err)
+				return err;
+			skip_copy = true;
+			break;
+		}
 
 		default:
 			OVS_NLERR(log, "Unknown Action type %d", type);
@@ -3780,6 +3961,59 @@ static int masked_set_action_to_set_action_attr(const struct nlattr *a,
 	return 0;
 }
 
+
+static int ovs_socket_action_to_attr(const struct nlattr *attr,
+				     struct sk_buff *skb)
+{
+	struct nlattr *start, *ac_start = NULL;
+	const struct socket_action_arg *arg;
+	const struct nlattr *a, *sock_arg;
+	int err = 0, rem = nla_len(attr);
+
+	start = nla_nest_start_noflag(skb, OVS_ACTION_ATTR_SOCKET);
+	if (!start)
+		return -EMSGSIZE;
+
+	/* The first nested attribute in 'attr' will be
+	 * the socket arg. */
+	sock_arg = nla_data(attr);
+	arg = nla_data(sock_arg);
+
+	if (nla_put_u32(skb, OVS_SOCKET_ACTION_ATTR_NETNS_ID,
+			arg->netns_id)) {
+		err = -EMSGSIZE;
+		goto out;
+	}
+
+	if (nla_put(skb, OVS_SOCKET_ACTION_ATTR_INODE,
+		    sizeof(arg->socket_inode), &arg->socket_inode)) {
+		err = -EMSGSIZE;
+		goto out;
+	}
+
+	a = nla_next(sock_arg, &rem);
+	ac_start = nla_nest_start_noflag(skb,
+					 OVS_SOCKET_ACTION_ATTR_ACTIONS);
+	if (!ac_start) {
+		err = -EMSGSIZE;
+		goto out;
+	}
+
+	err = ovs_nla_put_actions(nla_data(a), nla_len(a), skb);
+	if (err) {
+		nla_nest_cancel(skb, ac_start);
+		goto out;
+	}
+
+	nla_nest_end(skb, ac_start);
+	nla_nest_end(skb, start);
+	return 0;
+
+out:
+	nla_nest_cancel(skb, start);
+	return err;
+}
+
 int ovs_nla_put_actions(const struct nlattr *attr, int len, struct sk_buff *skb)
 {
 	const struct nlattr *a;
@@ -3827,6 +4061,12 @@ int ovs_nla_put_actions(const struct nlattr *attr, int len, struct sk_buff *skb)
 
 		case OVS_ACTION_ATTR_DEC_TTL:
 			err = dec_ttl_action_to_attr(a, skb);
+			if (err)
+				return err;
+			break;
+
+		case OVS_ACTION_ATTR_SOCKET:
+			err = ovs_socket_action_to_attr(a, skb);
 			if (err)
 				return err;
 			break;
