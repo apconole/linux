@@ -10,6 +10,7 @@
 #include <linux/ip.h>
 #include <linux/openvswitch.h>
 #include <linux/sctp.h>
+#include <linux/spinlock.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/in6.h>
@@ -1381,13 +1382,16 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 
 	if (unlikely(!OVS_CB(skb)->sk_map_data) ||
 	    OVS_CB(skb)->sk_map_data->key_type == OVS_SK_MAP_KEY_UNSET) {
-		net_warn_ratelimited("Attempt to use ovs sk_map without a valid tuple.\n");
 		goto recirc_action;
 	}
 
-	list_for_each_entry(n, &dp->sock_list, list_node) {
+	rcu_read_lock_bh();
+	list_for_each_entry_rcu(n, &dp->sock_list, list_node) {
+		/* In general, the list elements should be considered 'immutable'
+		 * but in practice, it may be best to always use
+		 * `rcu_dereference` for each element. */
 		if (ovs_cmp_sock_md(&n->key, OVS_CB(skb)->sk_map_data)) {
-			struct sock *sk = n->output_sock;
+			struct sock *sk = rcu_dereference(n->output_sock);
 			unsigned int pull_len = 0;
 			int ret;
 
@@ -1401,12 +1405,14 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 			ret = enqueue_skb_to_tcp_socket(sk, skb);
 			if (ret == -EAGAIN)
 				goto recirc_action;
+			rcu_read_unlock_bh();
 
 			return ret;
 		}
 	}
 
  recirc_action:
+	rcu_read_unlock_bh();
 	recirc_id = nla_get_u32(a);
 	return clone_execute(dp, skb, key, recirc_id, NULL, 0, last, true);
 }
@@ -1452,16 +1458,16 @@ static int execute_ovs_sk_map_metadata(struct sk_buff *skb,
 		return 0;
 	}
 
-#if 0
 	/* PoC: Just do ipv4, but this needs to expand for a real solution. */
 	if (skmd->key_type == OVS_SK_MAP_KEY_UNSET &&
-	    in_port->dev->rtnl_link_ops &&
-	    in_port->dev->rtnl_link_ops->get_link_net) {
+	    OVS_CB(skb)->input_vport->dev->rtnl_link_ops &&
+	    OVS_CB(skb)->input_vport->dev->rtnl_link_ops->get_link_net) {
+		struct vport *vp = OVS_CB(skb)->input_vport;
 		struct sock *sk;
 		struct net *ns;
 		u32 ifindex;
 
-		ns = in_port->dev->rtnl_link_ops->get_link_net(in_port->dev);
+		ns = vp->dev->rtnl_link_ops->get_link_net(vp->dev);
 		ifindex = inet_iif(skb);
 
 		/* We swap src/dst when lookup input side. */
@@ -1475,7 +1481,6 @@ static int execute_ovs_sk_map_metadata(struct sk_buff *skb,
 			return 0;
 		}
 	}
-#endif
 
 	skmd->key_type = OVS_SK_MAP_KEY_TUPLE_BASED;
 	skmd->key.tuple.ip.ipv4.src = key->ipv4.addr.src;
@@ -1497,7 +1502,7 @@ static int execute_ovs_add_sock(struct datapath *dp, struct sk_buff *skb,
 	struct sock *sock = NULL;
 
 	if (!skmd) {
-		return -EINVAL;
+		return 0;
 	}
 
 	if (likely(vport && netif_running(vport->dev) &&
@@ -1519,16 +1524,19 @@ static int execute_ovs_add_sock(struct datapath *dp, struct sk_buff *skb,
 		struct dp_sk_mnode *node;
 		struct dp_sk_mnode *n;
 
-		list_for_each_entry(n, &dp->sock_list, list_node) {
+		rcu_read_lock_bh();
+		list_for_each_entry_rcu(n, &dp->sock_list, list_node) {
 			if (ovs_cmp_sock_md(&n->key,
 					    OVS_CB(skb)->sk_map_data)) {
-				/* get_socket above took a ref, so must
+				/* get_socket above took a ref, so must 
 				 * actually close it here.
 				 */
 				sock_put(sock);
+				rcu_read_unlock_bh();
 				return 0;
 			}
 		}
+		rcu_read_unlock_bh();
 
 		node = kzalloc(sizeof(*node), GFP_ATOMIC);
 		if (!node) {
@@ -1541,7 +1549,10 @@ static int execute_ovs_add_sock(struct datapath *dp, struct sk_buff *skb,
 
 		node->key = *OVS_CB(skb)->sk_map_data;
 		node->output_sock = sock;
-		list_add(&node->list_node, &dp->sock_list);
+		spin_lock_bh(&dp->sock_list_lock);
+		list_add_rcu(&node->list_node, &dp->sock_list);
+		spin_unlock_bh(&dp->sock_list_lock);
+		OVS_CB(skb)->sk_map_data = NULL;
 	}
 
 	return 0;

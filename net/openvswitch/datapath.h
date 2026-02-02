@@ -107,6 +107,7 @@ struct ovs_skb_sk_map_data {
 
 struct dp_sk_mnode {
 	struct list_head		list_node;
+	struct rcu_head			rcu;
 	struct ovs_skb_sk_map_data	key;
 	struct sock			*output_sock;
 };
@@ -156,6 +157,7 @@ struct datapath {
 
 	/* Socket list */
 	struct list_head sock_list;
+	spinlock_t sock_list_lock;
 };
 
 /**
@@ -220,6 +222,7 @@ struct dp_upcall_info {
 struct ovs_net {
 	struct list_head dps;
 	struct work_struct dp_notify_work;
+	struct work_struct dp_skmap_cleanup_work;
 	struct delayed_work masks_rebalance;
 #if	IS_ENABLED(CONFIG_NETFILTER_CONNCOUNT)
 	struct ovs_ct_limit_info *ct_limit_info;

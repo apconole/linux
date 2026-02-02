@@ -137,6 +137,7 @@ static void ovs_dp_masks_rebalance(struct work_struct *work);
 
 static int ovs_dp_set_upcall_portids(struct datapath *, const struct nlattr *);
 
+static void free_sock_map_entry(struct rcu_head *rcu);
 /* Must be called with rcu_read_lock or ovs_mutex. */
 const char *ovs_dp_name(const struct datapath *dp)
 {
@@ -162,22 +163,23 @@ static int get_dpifindex(const struct datapath *dp)
 	return ifindex;
 }
 
+static void free_sock_map_entry(struct rcu_head *rcu)
+{
+	struct dp_sk_mnode *entry = container_of(rcu, struct dp_sk_mnode, rcu);
+
+	sock_put(entry->output_sock);
+	kfree(entry);
+}
+
 static void destroy_dp_rcu(struct rcu_head *rcu)
 {
 	struct datapath *dp = container_of(rcu, struct datapath, rcu);
-	struct dp_sk_mnode *n, *cur;
 
 	ovs_flow_tbl_destroy(&dp->table);
 	free_percpu(dp->stats_percpu);
 	kfree(dp->ports);
 	ovs_meters_exit(dp);
 	kfree(rcu_dereference_raw(dp->upcall_portids));
-
-	list_for_each_entry_safe(cur, n, &dp->sock_list, list_node) {
-		sock_put(cur->output_sock);
-		kfree(cur);
-	}
-
 	kfree(dp);
 }
 
@@ -1902,6 +1904,7 @@ static int ovs_dp_cmd_new(struct sk_buff *skb, struct genl_info *info)
 	list_add_tail_rcu(&dp->list_node, &ovs_net->dps);
 
 	INIT_LIST_HEAD(&dp->sock_list);
+	spin_lock_init(&dp->sock_list_lock);
 
 	ovs_unlock();
 
@@ -1931,6 +1934,7 @@ err:
 static void __dp_destroy(struct datapath *dp)
 {
 	struct flow_table *table = &dp->table;
+	struct dp_sk_mnode *cur, *n;
 	int i;
 
 	if (dp->user_features & OVS_DP_F_TC_RECIRC_SHARING)
@@ -1958,6 +1962,14 @@ static void __dp_destroy(struct datapath *dp)
 	 */
 	table_instance_flow_flush(table, ovsl_dereference(table->ti),
 				  ovsl_dereference(table->ufid_ti));
+
+	/* Flush the socket list for this DP */
+	spin_lock_bh(&dp->sock_list_lock);
+	list_for_each_entry_safe(cur, n, &dp->sock_list, list_node) {
+		list_del_rcu(&cur->list_node);
+		call_rcu(&cur->rcu, free_sock_map_entry);
+	}
+	spin_unlock_bh(&dp->sock_list_lock);
 
 	/* RCU destroy the ports, meters and flow tables. */
 	call_rcu(&dp->rcu, destroy_dp_rcu);
@@ -2580,6 +2592,36 @@ static void ovs_dp_masks_rebalance(struct work_struct *work)
 			      msecs_to_jiffies(DP_MASKS_REBALANCE_INTERVAL));
 }
 
+static void ovs_sock_list_probe(struct datapath *dp)
+{
+	struct dp_sk_mnode *cur, *n;
+
+	/* Flush the socket list for this DP */
+	spin_lock_bh(&dp->sock_list_lock);
+	list_for_each_entry_safe(cur, n, &dp->sock_list, list_node) {
+		struct sock *sk = rcu_dereference(cur->output_sock);
+		bh_lock_sock_nested(sk);
+		if (sk->sk_state != TCP_ESTABLISHED) {
+			list_del_rcu(&cur->list_node);
+			call_rcu(&cur->rcu, free_sock_map_entry);
+		}
+		bh_unlock_sock(sk);
+	}
+	spin_unlock_bh(&dp->sock_list_lock);
+}
+
+static void ovs_dp_skmap_cleanup_wq(struct work_struct *work)
+{
+	struct ovs_net *ovs_net = container_of(work, struct ovs_net,
+					       dp_skmap_cleanup_work);
+	struct datapath *dp;
+
+	ovs_lock();
+	list_for_each_entry(dp, &ovs_net->dps, list_node)
+		ovs_sock_list_probe(dp);
+	ovs_unlock();
+}
+
 static const struct nla_policy vport_policy[OVS_VPORT_ATTR_MAX + 1] = {
 	[OVS_VPORT_ATTR_NAME] = { .type = NLA_NUL_STRING, .len = IFNAMSIZ - 1 },
 	[OVS_VPORT_ATTR_STATS] = { .len = sizeof(struct ovs_vport_stats) },
@@ -2677,6 +2719,7 @@ static int __net_init ovs_init_net(struct net *net)
 
 	INIT_LIST_HEAD(&ovs_net->dps);
 	INIT_WORK(&ovs_net->dp_notify_work, ovs_dp_notify_wq);
+	INIT_WORK(&ovs_net->dp_skmap_cleanup_work, ovs_dp_skmap_cleanup_wq);
 	INIT_DELAYED_WORK(&ovs_net->masks_rebalance, ovs_dp_masks_rebalance);
 
 	err = ovs_ct_init(net);
@@ -2741,6 +2784,7 @@ static void __net_exit ovs_exit_net(struct net *dnet)
 
 	cancel_delayed_work_sync(&ovs_net->masks_rebalance);
 	cancel_work_sync(&ovs_net->dp_notify_work);
+	cancel_work_sync(&ovs_net->dp_skmap_cleanup_work);
 }
 
 static struct pernet_operations ovs_net_ops = {
