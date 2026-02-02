@@ -54,6 +54,7 @@ unsigned int ovs_net_id __read_mostly;
 static struct genl_family dp_packet_genl_family;
 static struct genl_family dp_flow_genl_family;
 static struct genl_family dp_datapath_genl_family;
+static struct genl_family dp_skmap_genl_family;
 
 static const struct nla_policy flow_policy[];
 
@@ -67,6 +68,10 @@ static const struct genl_multicast_group ovs_dp_datapath_multicast_group = {
 
 static const struct genl_multicast_group ovs_dp_vport_multicast_group = {
 	.name = OVS_VPORT_MCGROUP,
+};
+
+static const struct genl_multicast_group ovs_dp_skmap_multicast_group = {
+	.name = OVS_SKMAP_MCGROUP,
 };
 
 /* Check if need to build a reply message.
@@ -2674,12 +2679,273 @@ struct genl_family dp_vport_genl_family __ro_after_init = {
 	.module = THIS_MODULE,
 };
 
+/* Socket map commands */
+
+static int ovs_skmap_cmd_fill_info(struct dp_sk_mnode *entry, int dp_ifindex,
+				   struct sk_buff *skb, u32 portid, u32 seq,
+				   u32 flags, u8 cmd)
+{
+	struct ovs_header *ovs_header;
+	struct sock *sk;
+	u8 sock_state;
+
+	ovs_header = genlmsg_put(skb, portid, seq, &dp_skmap_genl_family,
+				 flags, cmd);
+	if (!ovs_header)
+		return -EMSGSIZE;
+
+	ovs_header->dp_ifindex = dp_ifindex;
+
+	if (nla_put_u32(skb, OVS_SKMAP_ATTR_KEY_TYPE, entry->key.key_type))
+		goto nla_put_failure;
+
+	if (entry->key.key_type == OVS_SK_MAP_KEY_TUPLE_BASED) {
+		if (nla_put_be32(skb, OVS_SKMAP_ATTR_IPV4_SRC,
+				 entry->key.key.tuple.ip.ipv4.src) ||
+		    nla_put_be32(skb, OVS_SKMAP_ATTR_IPV4_DST,
+				 entry->key.key.tuple.ip.ipv4.dst) ||
+		    nla_put_be16(skb, OVS_SKMAP_ATTR_TP_SRC,
+				 entry->key.key.tuple.tp.src) ||
+		    nla_put_be16(skb, OVS_SKMAP_ATTR_TP_DST,
+				 entry->key.key.tuple.tp.dst) ||
+		    nla_put_u8(skb, OVS_SKMAP_ATTR_PROTOCOL,
+			       entry->key.key.tuple.protocol))
+			goto nla_put_failure;
+	}
+
+	sk = rcu_dereference(entry->output_sock);
+	if (sk) {
+		sock_state = sk->sk_state;
+		if (nla_put_u8(skb, OVS_SKMAP_ATTR_SOCK_STATE, sock_state))
+			goto nla_put_failure;
+	}
+
+	genlmsg_end(skb, ovs_header);
+	return 0;
+
+nla_put_failure:
+	genlmsg_cancel(skb, ovs_header);
+	return -EMSGSIZE;
+}
+
+static struct sk_buff *ovs_skmap_cmd_alloc_info(void)
+{
+	return nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+}
+
+static struct dp_sk_mnode *ovs_skmap_lookup(struct datapath *dp,
+					    struct nlattr **a)
+{
+	struct dp_sk_mnode *entry;
+	u32 key_type;
+
+	if (!a[OVS_SKMAP_ATTR_KEY_TYPE])
+		return ERR_PTR(-EINVAL);
+
+	key_type = nla_get_u32(a[OVS_SKMAP_ATTR_KEY_TYPE]);
+
+	list_for_each_entry_rcu(entry, &dp->sock_list, list_node,
+				lockdep_ovsl_is_held()) {
+		if (entry->key.key_type != key_type)
+			continue;
+
+		if (key_type == OVS_SK_MAP_KEY_TUPLE_BASED) {
+			if (!a[OVS_SKMAP_ATTR_IPV4_SRC] ||
+			    !a[OVS_SKMAP_ATTR_IPV4_DST] ||
+			    !a[OVS_SKMAP_ATTR_TP_SRC] ||
+			    !a[OVS_SKMAP_ATTR_TP_DST] ||
+			    !a[OVS_SKMAP_ATTR_PROTOCOL])
+				return ERR_PTR(-EINVAL);
+
+			if (entry->key.key.tuple.ip.ipv4.src !=
+			    nla_get_be32(a[OVS_SKMAP_ATTR_IPV4_SRC]))
+				continue;
+			if (entry->key.key.tuple.ip.ipv4.dst !=
+			    nla_get_be32(a[OVS_SKMAP_ATTR_IPV4_DST]))
+				continue;
+			if (entry->key.key.tuple.tp.src !=
+			    nla_get_be16(a[OVS_SKMAP_ATTR_TP_SRC]))
+				continue;
+			if (entry->key.key.tuple.tp.dst !=
+			    nla_get_be16(a[OVS_SKMAP_ATTR_TP_DST]))
+				continue;
+			if (entry->key.key.tuple.protocol !=
+			    nla_get_u8(a[OVS_SKMAP_ATTR_PROTOCOL]))
+				continue;
+		}
+
+		return entry;
+	}
+
+	return ERR_PTR(-ENOENT);
+}
+
+static int ovs_skmap_cmd_get(struct sk_buff *skb, struct genl_info *info)
+{
+	struct ovs_header *ovs_header = genl_info_userhdr(info);
+	struct nlattr **a = info->attrs;
+	struct dp_sk_mnode *entry;
+	struct sk_buff *reply;
+	struct datapath *dp;
+	int err;
+
+	reply = ovs_skmap_cmd_alloc_info();
+	if (!reply)
+		return -ENOMEM;
+
+	ovs_lock();
+	dp = get_dp(sock_net(skb->sk), ovs_header->dp_ifindex);
+	if (!dp) {
+		err = -ENODEV;
+		goto err_unlock_free;
+	}
+
+	entry = ovs_skmap_lookup(dp, a);
+	if (IS_ERR(entry)) {
+		err = PTR_ERR(entry);
+		goto err_unlock_free;
+	}
+
+	err = ovs_skmap_cmd_fill_info(entry, ovs_header->dp_ifindex, reply,
+				      info->snd_portid, info->snd_seq, 0,
+				      OVS_SKMAP_CMD_GET);
+	if (err)
+		goto err_unlock_free;
+
+	ovs_unlock();
+	return genlmsg_reply(reply, info);
+
+err_unlock_free:
+	ovs_unlock();
+	kfree_skb(reply);
+	return err;
+}
+
+static int ovs_skmap_cmd_dump(struct sk_buff *skb, struct netlink_callback *cb)
+{
+	struct ovs_header *ovs_header = genlmsg_data(nlmsg_data(cb->nlh));
+	struct dp_sk_mnode *entry;
+	struct datapath *dp;
+	int skip = cb->args[0];
+	int i = 0;
+
+	rcu_read_lock();
+	dp = get_dp_rcu(sock_net(skb->sk), ovs_header->dp_ifindex);
+	if (!dp) {
+		rcu_read_unlock();
+		return -ENODEV;
+	}
+
+	list_for_each_entry_rcu(entry, &dp->sock_list, list_node) {
+		if (i >= skip &&
+		    ovs_skmap_cmd_fill_info(entry, ovs_header->dp_ifindex, skb,
+					    NETLINK_CB(cb->skb).portid,
+					    cb->nlh->nlmsg_seq, NLM_F_MULTI,
+					    OVS_SKMAP_CMD_GET) < 0)
+			break;
+		i++;
+	}
+	rcu_read_unlock();
+
+	cb->args[0] = i;
+	return skb->len;
+}
+
+static int ovs_skmap_cmd_del(struct sk_buff *skb, struct genl_info *info)
+{
+	struct ovs_header *ovs_header = genl_info_userhdr(info);
+	struct nlattr **a = info->attrs;
+	struct dp_sk_mnode *entry;
+	struct sk_buff *reply;
+	struct datapath *dp;
+	int err;
+
+	reply = ovs_skmap_cmd_alloc_info();
+	if (!reply)
+		return -ENOMEM;
+
+	ovs_lock();
+	dp = get_dp(sock_net(skb->sk), ovs_header->dp_ifindex);
+	if (!dp) {
+		err = -ENODEV;
+		goto err_unlock_free;
+	}
+
+	entry = ovs_skmap_lookup(dp, a);
+	if (IS_ERR(entry)) {
+		err = PTR_ERR(entry);
+		goto err_unlock_free;
+	}
+
+	err = ovs_skmap_cmd_fill_info(entry, ovs_header->dp_ifindex, reply,
+				      info->snd_portid, info->snd_seq, 0,
+				      OVS_SKMAP_CMD_DEL);
+	if (err)
+		goto err_unlock_free;
+
+	spin_lock_bh(&dp->sock_list_lock);
+	list_del_rcu(&entry->list_node);
+	spin_unlock_bh(&dp->sock_list_lock);
+
+	ovs_unlock();
+
+	call_rcu(&entry->rcu, free_sock_map_entry);
+	ovs_notify(&dp_skmap_genl_family, reply, info);
+	return 0;
+
+err_unlock_free:
+	ovs_unlock();
+	kfree_skb(reply);
+	return err;
+}
+
+static const struct nla_policy skmap_policy[OVS_SKMAP_ATTR_MAX + 1] = {
+	[OVS_SKMAP_ATTR_KEY_TYPE] = { .type = NLA_U32 },
+	[OVS_SKMAP_ATTR_IPV4_SRC] = { .type = NLA_U32 },
+	[OVS_SKMAP_ATTR_IPV4_DST] = { .type = NLA_U32 },
+	[OVS_SKMAP_ATTR_TP_SRC] = { .type = NLA_U16 },
+	[OVS_SKMAP_ATTR_TP_DST] = { .type = NLA_U16 },
+	[OVS_SKMAP_ATTR_PROTOCOL] = { .type = NLA_U8 },
+	[OVS_SKMAP_ATTR_SOCK_STATE] = { .type = NLA_U8 },
+};
+
+static const struct genl_small_ops dp_skmap_genl_ops[] = {
+	{ .cmd = OVS_SKMAP_CMD_GET,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+	  .flags = 0,		    /* OK for unprivileged users. */
+	  .doit = ovs_skmap_cmd_get,
+	  .dumpit = ovs_skmap_cmd_dump
+	},
+	{ .cmd = OVS_SKMAP_CMD_DEL,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+	  .doit = ovs_skmap_cmd_del
+	},
+};
+
+static struct genl_family dp_skmap_genl_family __ro_after_init = {
+	.hdrsize = sizeof(struct ovs_header),
+	.name = OVS_SKMAP_FAMILY,
+	.version = OVS_SKMAP_VERSION,
+	.maxattr = OVS_SKMAP_ATTR_MAX,
+	.policy = skmap_policy,
+	.netnsok = true,
+	.parallel_ops = true,
+	.small_ops = dp_skmap_genl_ops,
+	.n_small_ops = ARRAY_SIZE(dp_skmap_genl_ops),
+	.resv_start_op = OVS_SKMAP_CMD_DEL + 1,
+	.mcgrps = &ovs_dp_skmap_multicast_group,
+	.n_mcgrps = 1,
+	.module = THIS_MODULE,
+};
+
 static struct genl_family * const dp_genl_families[] = {
 	&dp_datapath_genl_family,
 	&dp_vport_genl_family,
 	&dp_flow_genl_family,
 	&dp_packet_genl_family,
 	&dp_meter_genl_family,
+	&dp_skmap_genl_family,
 #if	IS_ENABLED(CONFIG_NETFILTER_CONNCOUNT)
 	&dp_ct_limit_genl_family,
 #endif

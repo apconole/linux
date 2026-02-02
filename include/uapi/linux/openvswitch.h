@@ -1142,6 +1142,50 @@ struct ovs_zone_limit {
 	__u32 count;
 };
 
+/* Socket map */
+#define OVS_SKMAP_FAMILY  "ovs_skmap"
+#define OVS_SKMAP_MCGROUP "ovs_skmap"
+#define OVS_SKMAP_VERSION 0x1
+
+enum ovs_skmap_cmd {
+	OVS_SKMAP_CMD_UNSPEC,
+	OVS_SKMAP_CMD_GET,		/* Get socket map entry. */
+	OVS_SKMAP_CMD_DEL		/* Delete socket map entry. */
+};
+
+/**
+ * enum ovs_skmap_attr - attributes for %OVS_SKMAP_* commands.
+ * @OVS_SKMAP_ATTR_KEY_TYPE: u32 key type (OVS_SK_MAP_KEY_*).
+ * @OVS_SKMAP_ATTR_IPV4_SRC: __be32 IPv4 source address (for tuple-based keys).
+ * @OVS_SKMAP_ATTR_IPV4_DST: __be32 IPv4 destination address (for tuple-based keys).
+ * @OVS_SKMAP_ATTR_TP_SRC: __be16 source port (for tuple-based keys).
+ * @OVS_SKMAP_ATTR_TP_DST: __be16 destination port (for tuple-based keys).
+ * @OVS_SKMAP_ATTR_PROTOCOL: u8 IP protocol (for tuple-based keys).
+ * @OVS_SKMAP_ATTR_SOCK_STATE: u8 socket state (TCP_ESTABLISHED, etc.).
+ *
+ * These attributes follow the &struct ovs_header within the Generic Netlink
+ * payload for %OVS_SKMAP_* commands.
+ */
+enum ovs_skmap_attr {
+	OVS_SKMAP_ATTR_UNSPEC,
+	OVS_SKMAP_ATTR_KEY_TYPE,	/* u32 key type */
+	OVS_SKMAP_ATTR_IPV4_SRC,	/* __be32 IPv4 source address */
+	OVS_SKMAP_ATTR_IPV4_DST,	/* __be32 IPv4 destination address */
+	OVS_SKMAP_ATTR_TP_SRC,		/* __be16 source port */
+	OVS_SKMAP_ATTR_TP_DST,		/* __be16 destination port */
+	OVS_SKMAP_ATTR_PROTOCOL,	/* u8 IP protocol */
+	OVS_SKMAP_ATTR_SOCK_STATE,	/* u8 socket state */
+	OVS_SKMAP_ATTR_PAD,
+	__OVS_SKMAP_ATTR_MAX
+};
+
+#define OVS_SKMAP_ATTR_MAX (__OVS_SKMAP_ATTR_MAX - 1)
+
+/* Key type values for OVS_SKMAP_ATTR_KEY_TYPE */
+#define OVS_SK_MAP_KEY_UNSET		0
+#define OVS_SK_MAP_KEY_INPUT_SOCKET	1
+#define OVS_SK_MAP_KEY_TUPLE		2
+
 enum ovs_dec_ttl_attr {
 	OVS_DEC_TTL_ATTR_UNSPEC,
 	OVS_DEC_TTL_ATTR_ACTION,	/* Nested struct nlattr */
