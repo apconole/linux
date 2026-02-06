@@ -2107,7 +2107,7 @@ no_coalesce:
 	}
 	return false;
 }
-EXPORT_IPV6_MOD(tcp_add_backlog);
+EXPORT_SYMBOL_GPL(tcp_add_backlog);
 
 static void tcp_v4_restore_cb(struct sk_buff *skb)
 {
