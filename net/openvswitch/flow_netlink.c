@@ -2312,6 +2312,20 @@ static void ovs_nla_free_check_pkt_len_action(const struct nlattr *action)
 	}
 }
 
+static void ovs_nla_free_sock_try_action(const struct nlattr *action)
+{
+	const struct nlattr *a;
+	int rem;
+
+	nla_for_each_nested(a, action, rem) {
+		switch (nla_type(a)) {
+		case OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS:
+			ovs_nla_free_nested_actions(nla_data(a), nla_len(a));
+			break;
+		}
+	}
+}
+
 static void ovs_nla_free_clone_action(const struct nlattr *action)
 {
 	const struct nlattr *a = nla_data(action);
@@ -2401,6 +2415,10 @@ static void ovs_nla_free_nested_actions(const struct nlattr *actions, int len)
 
 		case OVS_ACTION_ATTR_SET:
 			ovs_nla_free_set_action(a);
+			break;
+
+		case OVS_ACTION_ATTR_SOCK_TRY:
+			ovs_nla_free_sock_try_action(a);
 			break;
 		}
 	}
@@ -3109,6 +3127,62 @@ static int validate_and_copy_check_pkt_len(struct net *net,
 	return 0;
 }
 
+static const struct nla_policy
+sock_try_policy[OVS_SOCK_TRY_ATTR_MAX + 1] = {
+	[OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS] = { .type = NLA_NESTED },
+};
+
+static int validate_and_copy_sock_try(struct net *net,
+				      const struct nlattr *attr,
+				      const struct sw_flow_key *key,
+				      struct sw_flow_actions **sfa,
+				      __be16 eth_type, __be16 vlan_tci,
+				      u32 mpls_label_count,
+				      bool log, bool last, u32 depth)
+{
+	const struct nlattr *acts_on_miss;
+	struct nlattr *a[OVS_SOCK_TRY_ATTR_MAX + 1];
+	struct sock_try_arg arg;
+	int nested_acts_start;
+	int start, err;
+
+	err = nla_parse_deprecated_strict(a, OVS_SOCK_TRY_ATTR_MAX,
+					  nla_data(attr), nla_len(attr),
+					  sock_try_policy, NULL);
+	if (err)
+		return err;
+
+	acts_on_miss = a[OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS];
+	if (!acts_on_miss)
+		return -EINVAL;
+
+	start = add_nested_action_start(sfa, OVS_ACTION_ATTR_SOCK_TRY, log);
+	if (start < 0)
+		return start;
+
+	arg.exec_for_miss = last || !actions_may_change_flow(acts_on_miss);
+
+	err = ovs_nla_add_action(sfa, OVS_SOCK_TRY_ATTR_ARG, &arg,
+				 sizeof(arg), log);
+	if (err)
+		return err;
+
+	nested_acts_start = add_nested_action_start(sfa,
+		OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS, log);
+	if (nested_acts_start < 0)
+		return nested_acts_start;
+
+	err = __ovs_nla_copy_actions(net, acts_on_miss, key, sfa,
+				     eth_type, vlan_tci, mpls_label_count,
+				     log, depth + 1);
+	if (err)
+		return err;
+
+	add_nested_action_end(*sfa, nested_acts_start);
+	add_nested_action_end(*sfa, start);
+	return 0;
+}
+
 static int validate_psample(const struct nlattr *attr)
 {
 	static const struct nla_policy policy[OVS_PSAMPLE_ATTR_MAX + 1] = {
@@ -3187,7 +3261,7 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
 			[OVS_ACTION_ATTR_DEC_TTL] = (u32)-1,
 			[OVS_ACTION_ATTR_DROP] = sizeof(u32),
 			[OVS_ACTION_ATTR_PSAMPLE] = (u32)-1,
-			[OVS_ACTION_ATTR_SOCK_TRY] = sizeof(u32),
+			[OVS_ACTION_ATTR_SOCK_TRY] = (u32)-1,
 			[OVS_ACTION_ATTR_MD_SOCK_TUPLE] = 0,
 			[OVS_ACTION_ATTR_ADD_SOCK] = sizeof(u32),
 		};
@@ -3474,7 +3548,21 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
 				return err;
 			break;
 
-		case OVS_ACTION_ATTR_SOCK_TRY:		fallthrough;
+		case OVS_ACTION_ATTR_SOCK_TRY: {
+			bool last = nla_is_last(a, rem);
+
+			err = validate_and_copy_sock_try(net, a, key, sfa,
+							 eth_type,
+							 vlan_tci,
+							 mpls_label_count,
+							 log, last,
+							 depth);
+			if (err)
+				return err;
+			skip_copy = true;
+			break;
+		}
+
 		case OVS_ACTION_ATTR_MD_SOCK_TUPLE:
 			break;
 
@@ -3657,6 +3745,45 @@ out:
 	return err;
 }
 
+static int sock_try_action_to_attr(const struct nlattr *attr,
+				   struct sk_buff *skb)
+{
+	struct nlattr *start, *ac_start;
+	const struct nlattr *a, *st_arg;
+	int err = 0, rem = nla_len(attr);
+
+	start = nla_nest_start_noflag(skb, OVS_ACTION_ATTR_SOCK_TRY);
+	if (!start)
+		return -EMSGSIZE;
+
+	/* First nested attr is OVS_SOCK_TRY_ATTR_ARG (kernel-only, skip). */
+	st_arg = nla_data(attr);
+
+	/* Second nested attr is OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS. */
+	a = nla_next(st_arg, &rem);
+
+	ac_start = nla_nest_start_noflag(skb,
+					 OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS);
+	if (!ac_start) {
+		err = -EMSGSIZE;
+		goto out;
+	}
+
+	err = ovs_nla_put_actions(nla_data(a), nla_len(a), skb);
+	if (err) {
+		nla_nest_cancel(skb, ac_start);
+		goto out;
+	}
+
+	nla_nest_end(skb, ac_start);
+	nla_nest_end(skb, start);
+	return 0;
+
+out:
+	nla_nest_cancel(skb, start);
+	return err;
+}
+
 static int dec_ttl_action_to_attr(const struct nlattr *attr,
 				  struct sk_buff *skb)
 {
@@ -3801,6 +3928,12 @@ int ovs_nla_put_actions(const struct nlattr *attr, int len, struct sk_buff *skb)
 
 		case OVS_ACTION_ATTR_DEC_TTL:
 			err = dec_ttl_action_to_attr(a, skb);
+			if (err)
+				return err;
+			break;
+
+		case OVS_ACTION_ATTR_SOCK_TRY:
+			err = sock_try_action_to_attr(a, skb);
 			if (err)
 				return err;
 			break;

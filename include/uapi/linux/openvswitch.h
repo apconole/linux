@@ -921,6 +921,33 @@ struct check_pkt_len_arg {
 };
 #endif
 
+/**
+ * enum ovs_sock_try_attr - Attributes for %OVS_ACTION_ATTR_SOCK_TRY.
+ *
+ * @OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS: Nested OVS_ACTION_ATTR_* actions to
+ * apply if the socket lookup fails (no matching socket, socket not in correct
+ * state, or enqueue to socket fails).
+ */
+enum ovs_sock_try_attr {
+	OVS_SOCK_TRY_ATTR_UNSPEC,
+	OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS,	/* Nested OVS_ACTION_ATTR_* */
+	__OVS_SOCK_TRY_ATTR_MAX,
+
+#ifdef __KERNEL__
+	OVS_SOCK_TRY_ATTR_ARG			/* struct sock_try_arg */
+#endif
+};
+
+#define OVS_SOCK_TRY_ATTR_MAX (__OVS_SOCK_TRY_ATTR_MAX - 1)
+
+#ifdef __KERNEL__
+struct sock_try_arg {
+	bool exec_for_miss;	/* When true, actions in ACTIONS_ON_MISS will
+				 * not change flow keys. False otherwise.
+				 */
+};
+#endif
+
 #define OVS_PSAMPLE_COOKIE_MAX_SIZE 16
 /**
  * enum ovs_psample_attr - Attributes for %OVS_ACTION_ATTR_PSAMPLE
@@ -1039,11 +1066,12 @@ enum ovs_action_attr {
 	OVS_ACTION_ATTR_DEC_TTL,      /* Nested OVS_DEC_TTL_ATTR_*. */
 	OVS_ACTION_ATTR_DROP,         /* u32 error code. */
 	OVS_ACTION_ATTR_PSAMPLE,      /* Nested OVS_PSAMPLE_ATTR_*. */
-	OVS_ACTION_ATTR_SOCK_TRY,     /* Attempt to find a socket in the map.
+	OVS_ACTION_ATTR_SOCK_TRY,     /* Nested OVS_SOCK_TRY_ATTR_*.
+				       * Attempt to find a socket in the map.
 				       * If an appropriate socket is found,
 				       * then the packet is forwarded and the
-				       * pipeline ends.  Otherwise, jump to
-				       * u32 recirc id. */
+				       * pipeline ends.  Otherwise, execute
+				       * the nested miss actions. */
 	OVS_ACTION_ATTR_MD_SOCK_TUPLE, /* Sets the socket map criteria to use
 					* the key's 5-tuple details. */
 	OVS_ACTION_ATTR_ADD_SOCK,     /* Looks at the port specified by u32,
@@ -1180,11 +1208,6 @@ enum ovs_skmap_attr {
 };
 
 #define OVS_SKMAP_ATTR_MAX (__OVS_SKMAP_ATTR_MAX - 1)
-
-/* Key type values for OVS_SKMAP_ATTR_KEY_TYPE */
-#define OVS_SK_MAP_KEY_UNSET		0
-#define OVS_SK_MAP_KEY_INPUT_SOCKET	1
-#define OVS_SK_MAP_KEY_TUPLE		2
 
 enum ovs_dec_ttl_attr {
 	OVS_DEC_TTL_ATTR_UNSPEC,

@@ -1375,14 +1375,17 @@ tcp_add_done:
 
 static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 			    struct sw_flow_key *key,
-			    const struct nlattr *a, bool last)
+			    const struct nlattr *attr, bool last)
 {
+	const struct nlattr *actions, *st_arg;
+	const struct sock_try_arg *arg;
+	int rem = nla_len(attr);
+	bool clone_flow_key;
 	struct dp_sk_mnode *n;
-	u32 recirc_id;
 
 	if (unlikely(!OVS_CB(skb)->sk_map_data) ||
 	    OVS_CB(skb)->sk_map_data->key_type == OVS_SK_MAP_KEY_UNSET) {
-		goto recirc_action;
+		goto miss_action;
 	}
 
 	rcu_read_lock_bh();
@@ -1399,47 +1402,61 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 			    !ovs_skbuff_validate_for_sockmap(skb, &pull_len) ||
 			    (skb->pkt_type != PACKET_HOST &&
 			     skb->pkt_type != PACKET_OTHERHOST)) {
-				goto recirc_action;
+				rcu_read_unlock_bh();
+				goto miss_action;
 			}
 
 			ret = enqueue_skb_to_tcp_socket(sk, skb);
-			if (ret == -EAGAIN)
-				goto recirc_action;
+			if (ret == -EAGAIN) {
+				rcu_read_unlock_bh();
+				goto miss_action;
+			}
 			rcu_read_unlock_bh();
 
 			return ret;
 		}
 	}
-
- recirc_action:
 	rcu_read_unlock_bh();
-	recirc_id = nla_get_u32(a);
-	return clone_execute(dp, skb, key, recirc_id, NULL, 0, last, true);
+
+ miss_action:
+	/* First nested attr is OVS_SOCK_TRY_ATTR_ARG. */
+	st_arg = nla_data(attr);
+	arg = nla_data(st_arg);
+	clone_flow_key = !arg->exec_for_miss;
+
+	/* Second nested attr is OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS. */
+	actions = nla_next(st_arg, &rem);
+
+	return clone_execute(dp, skb, key, 0, nla_data(actions),
+			     nla_len(actions), last, clone_flow_key);
 }
 
 static struct sock *get_socket(struct net *net, __be32 saddr, __be16 sport,
 			       __be32 daddr, __be16 dport, u32 idx, bool ref)
 {
 	struct sock *sk = NULL;
-	struct inet_hashinfo *hashinfo = &tcp_hashinfo;
-	spinlock_t *lock;
-	u32 hash;
 
-	hash = inet_ehashfn(net, daddr, dport, saddr, sport);
-	lock = inet_ehash_lockp(hashinfo, hash);
-
-	spin_lock_bh(lock);
-	sk = __inet_lookup_established(net, hashinfo, saddr, sport, daddr,
+	sk = __inet_lookup_established(net, saddr, sport, daddr,
 				       dport, idx, 0);
-	/* take a reference to the socket while under the lock. */
-	if (sk && sk->sk_state == TCP_ESTABLISHED && ref)
-		sock_hold(sk);
-	else
-		sk = NULL;
-	spin_unlock_bh(lock);
+	if (!sk)
+		return NULL;
 
-	/* At this point the caller has a valid reference to the socket. */
-	return sk && sk->sk_state == TCP_ESTABLISHED ? sk : NULL;
+	/* Advisory check - the sk_state could change, but we'll revalidate it
+	 * later on anyway*/
+	if (sk->sk_state != TCP_ESTABLISHED)
+		goto out_put;
+
+	if (ref)
+		sock_hold(sk);
+
+	sock_put(sk);
+	if (!ref)
+		return NULL;
+	return sk;
+
+out_put:
+	sock_put(sk);
+	return NULL;
 }
 
 static int execute_ovs_sk_map_metadata(struct sk_buff *skb,

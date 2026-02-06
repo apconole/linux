@@ -392,7 +392,7 @@ class ovsactions(nla):
         ("OVS_ACTION_ATTR_DEC_TTL", "none"),
         ("OVS_ACTION_ATTR_DROP", "uint32"),
         ("OVS_ACTION_ATTR_PSAMPLE", "psample"),
-        ("OVS_ACTION_ATTR_SOCK_TRY", "uint32"),
+        ("OVS_ACTION_ATTR_SOCK_TRY", "sock_try"),
         ("OVS_ACTION_ATTR_MD_SOCK_TUPLE", "flag"),
         ("OVS_ACTION_ATTR_ADD_SOCK", "uint32"),
     )
@@ -471,6 +471,29 @@ class ovsactions(nla):
             for attr in attrs:
                 self["attrs"].append(attr)
 
+            return actstr
+
+    class sock_try(nla):
+        nla_flags = NLA_F_NESTED
+
+        nla_map = (
+            ("OVS_SOCK_TRY_ATTR_UNSPEC", "none"),
+            ("OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS", "ovsactions"),
+        )
+
+        def dpstr(self, more=False):
+            actions = self.get_attr("OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS")
+            if actions:
+                return actions.dpstr(more)
+            return ""
+
+        def parse(self, actstr):
+            subacts = ovsactions()
+            parsed_len = subacts.parse(actstr)
+            self["attrs"].append(
+                ["OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS", subacts]
+            )
+            actstr = actstr[parsed_len:]
             return actstr
 
     class ctact(nla):
@@ -645,8 +668,8 @@ class ovsactions(nla):
             elif field[0] == "OVS_ACTION_ATTR_MD_SOCK_TUPLE":
                 print_str += "sock(tuple)"
             elif field[0] == "OVS_ACTION_ATTR_SOCK_TRY":
-                print_str += "sock(try,recirc=%d)" % \
-                    int(self.get_attr(field[0]))
+                datum = self.get_attr(field[0])
+                print_str += "sock(try,%s)" % datum.dpstr(more)
             elif field[0] == "OVS_ACTION_ATTR_ADD_SOCK":
                 print_str += "sock(commit,%d)" % int(self.get_attr(field[0]))
             else:
@@ -893,15 +916,12 @@ class ovsactions(nla):
                 actstr = actstr[5:]
                 if actstr.startswith("try,"):
                     actstr = actstr[4:]
-                    actstr, val = parse_extract_field(
-                        actstr,
-                        "recirc=",
-                        r"([0-9a-fA-Fx]+)",
-                        lambda x: int(x, 0),
-                        False)
-                    if val is not None:
-                        self["attrs"].append(["OVS_ACTION_ATTR_SOCK_TRY", val])
-                        parsed = True
+                    sock_try_act = self.sock_try()
+                    actstr = sock_try_act.parse(actstr)
+                    self["attrs"].append(
+                        ["OVS_ACTION_ATTR_SOCK_TRY", sock_try_act]
+                    )
+                    parsed = True
                 elif actstr.startswith("tuple"):
                     actstr = actstr[5:]
                     parsed = True
