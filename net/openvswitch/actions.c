@@ -1406,6 +1406,22 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 				goto miss_action;
 			}
 
+			if (!last) {
+				struct sk_buff *nskb = skb_clone(skb, GFP_ATOMIC);
+				if (!nskb) {
+					rcu_read_unlock_bh();
+					return 0;
+				}
+				ret = enqueue_skb_to_tcp_socket(sk, nskb);
+				if (ret == -EAGAIN) {
+					kfree_skb(nskb);
+					rcu_read_unlock_bh();
+					goto miss_action;
+				}
+				rcu_read_unlock_bh();
+				return ret;
+			}
+
 			ret = enqueue_skb_to_tcp_socket(sk, skb);
 			if (ret == -EAGAIN) {
 				rcu_read_unlock_bh();
@@ -1565,7 +1581,7 @@ static int execute_ovs_add_sock(struct datapath *dp, struct sk_buff *skb,
 		}
 
 		node->key = *OVS_CB(skb)->sk_map_data;
-		node->output_sock = sock;
+		rcu_assign_pointer(node->output_sock, sock);
 		spin_lock_bh(&dp->sock_list_lock);
 		list_add_rcu(&node->list_node, &dp->sock_list);
 		spin_unlock_bh(&dp->sock_list_lock);

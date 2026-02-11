@@ -2605,12 +2605,10 @@ static void ovs_sock_list_probe(struct datapath *dp)
 	spin_lock_bh(&dp->sock_list_lock);
 	list_for_each_entry_safe(cur, n, &dp->sock_list, list_node) {
 		struct sock *sk = rcu_dereference(cur->output_sock);
-		bh_lock_sock_nested(sk);
-		if (sk->sk_state != TCP_ESTABLISHED) {
+		if (!sk || READ_ONCE(sk->sk_state) != TCP_ESTABLISHED) {
 			list_del_rcu(&cur->list_node);
 			call_rcu(&cur->rcu, free_sock_map_entry);
 		}
-		bh_unlock_sock(sk);
 	}
 	spin_unlock_bh(&dp->sock_list_lock);
 }
