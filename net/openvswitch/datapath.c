@@ -633,6 +633,7 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
 	struct datapath *dp;
 	struct vport *input_vport;
 
+	struct ovs_skb_sk_map_data skmd = {};
 	u16 mru = 0;
 	u64 hash;
 	int len;
@@ -659,7 +660,7 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
 		packet->ignore_df = 1;
 	}
 	OVS_CB(packet)->mru = mru;
-	OVS_CB(packet)->sk_map_data = NULL;
+	OVS_CB(packet)->sk_map_data = &skmd;
 
 	if (a[OVS_PACKET_ATTR_HASH]) {
 		hash = nla_get_u64(a[OVS_PACKET_ATTR_HASH]);
