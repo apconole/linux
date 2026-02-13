@@ -273,7 +273,6 @@ struct ovs_pcpu_storage {
 	struct action_flow_keys flow_keys;
 	struct ovs_frag_data frag_data;
 	int exec_level;
-	int sock_try_depth;
 	struct task_struct *owner;
 	local_lock_t bh_lock;
 };

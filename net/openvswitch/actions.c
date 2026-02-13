@@ -1382,18 +1382,6 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 	int rem = nla_len(attr);
 	bool clone_flow_key;
 	struct dp_sk_mnode *n;
-	int err;
-
-	/* Prevent nested sock_try execution. If we're already inside a
-	 * sock_try, skip entirely - do not attempt socket lookup and do
-	 * not execute fallback actions.
-	 */
-	if (__this_cpu_read(ovs_pcpu_storage->sock_try_depth)) {
-		if (last)
-			ovs_kfree_skb_reason(skb, OVS_DROP_LAST_ACTION);
-		return 0;
-	}
-	__this_cpu_inc(ovs_pcpu_storage->sock_try_depth);
 
 	if (unlikely(!OVS_CB(skb)->sk_map_data) ||
 	    OVS_CB(skb)->sk_map_data->key_type == OVS_SK_MAP_KEY_UNSET) {
@@ -1422,7 +1410,6 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 				struct sk_buff *nskb = skb_clone(skb, GFP_ATOMIC);
 				if (!nskb) {
 					rcu_read_unlock_bh();
-					__this_cpu_dec(ovs_pcpu_storage->sock_try_depth);
 					return 0;
 				}
 				ret = enqueue_skb_to_tcp_socket(sk, nskb);
@@ -1432,7 +1419,6 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 					goto miss_action;
 				}
 				rcu_read_unlock_bh();
-				__this_cpu_dec(ovs_pcpu_storage->sock_try_depth);
 				return ret;
 			}
 
@@ -1443,7 +1429,6 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 			}
 			rcu_read_unlock_bh();
 
-			__this_cpu_dec(ovs_pcpu_storage->sock_try_depth);
 			return ret;
 		}
 	}
@@ -1458,11 +1443,8 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 	/* Second nested attr is OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS. */
 	actions = nla_next(st_arg, &rem);
 
-	err = clone_execute(dp, skb, key, 0, nla_data(actions),
-			    nla_len(actions), last, clone_flow_key);
-
-	__this_cpu_dec(ovs_pcpu_storage->sock_try_depth);
-	return err;
+	return clone_execute(dp, skb, key, 0, nla_data(actions),
+			     nla_len(actions), last, clone_flow_key);
 }
 
 static struct sock *get_socket(struct net *net, __be32 saddr, __be16 sport,
