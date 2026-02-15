@@ -28,6 +28,7 @@
 #include <net/mpls.h>
 #include <net/tcp.h>
 #include <net/sock.h>
+#include <net/net_namespace.h>
 #include <net/snmp.h>
 
 #if IS_ENABLED(CONFIG_PSAMPLE)
@@ -1377,37 +1378,44 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 			    struct sw_flow_key *key,
 			    const struct nlattr *attr, bool last)
 {
-	const struct nlattr *actions, *st_arg;
+	const struct nlattr *miss_acts, *st_arg;
 	const struct sock_try_arg *arg;
 	int rem = nla_len(attr);
 	bool clone_flow_key;
 	struct dp_sk_mnode *n;
 
+	/* Pre-parse the nested structure so the miss path is a direct
+	 * jump with no additional pointer chasing.
+	 * First nested attr: OVS_SOCK_TRY_ATTR_ARG
+	 * Second nested attr: OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS
+	 */
+	st_arg = nla_data(attr);
+	arg = nla_data(st_arg);
+	clone_flow_key = !arg->exec_for_miss;
+	miss_acts = nla_next(st_arg, &rem);
+
 	if (unlikely(!OVS_CB(skb)->sk_map_data) ||
-	    OVS_CB(skb)->sk_map_data->key_type == OVS_SK_MAP_KEY_UNSET) {
-		goto miss_action;
-	}
+	    OVS_CB(skb)->sk_map_data->key_type == OVS_SK_MAP_KEY_UNSET)
+		goto miss;
 
 	rcu_read_lock_bh();
 	list_for_each_entry_rcu(n, &dp->sock_list, list_node) {
-		/* In general, the list elements should be considered 'immutable'
-		 * but in practice, it may be best to always use
-		 * `rcu_dereference` for each element. */
 		if (ovs_cmp_sock_md(&n->key, OVS_CB(skb)->sk_map_data)) {
 			struct sock *sk = rcu_dereference(n->output_sock);
 			unsigned int pull_len = 0;
 			int ret;
 
-			if (!sk || (sk->sk_state != TCP_ESTABLISHED) ||
+			if (!sk || sk->sk_state != TCP_ESTABLISHED ||
 			    !ovs_skbuff_validate_for_sockmap(skb, &pull_len) ||
 			    (skb->pkt_type != PACKET_HOST &&
 			     skb->pkt_type != PACKET_OTHERHOST)) {
 				rcu_read_unlock_bh();
-				goto miss_action;
+				goto miss;
 			}
 
 			if (!last) {
 				struct sk_buff *nskb = skb_clone(skb, GFP_ATOMIC);
+
 				if (!nskb) {
 					rcu_read_unlock_bh();
 					return 0;
@@ -1416,7 +1424,7 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 				if (ret == -EAGAIN) {
 					kfree_skb(nskb);
 					rcu_read_unlock_bh();
-					goto miss_action;
+					goto miss;
 				}
 				rcu_read_unlock_bh();
 				return ret;
@@ -1425,26 +1433,29 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 			ret = enqueue_skb_to_tcp_socket(sk, skb);
 			if (ret == -EAGAIN) {
 				rcu_read_unlock_bh();
-				goto miss_action;
+				goto miss;
 			}
 			rcu_read_unlock_bh();
-
 			return ret;
 		}
 	}
 	rcu_read_unlock_bh();
 
- miss_action:
-	/* First nested attr is OVS_SOCK_TRY_ATTR_ARG. */
-	st_arg = nla_data(attr);
-	arg = nla_data(st_arg);
-	clone_flow_key = !arg->exec_for_miss;
+miss:
+	/* When this is the last action and the miss actions won't modify
+	 * the flow key (exec_for_miss), we can skip the clone_execute
+	 * trampoline and execute the miss actions directly on the
+	 * original skb and key.  This is the common case since
+	 * validate_and_copy_sock_try() always sets exec_for_miss when
+	 * sock_try is the last action.
+	 */
+	if (last && !clone_flow_key)
+		return do_execute_actions(dp, skb, key,
+					 nla_data(miss_acts),
+					 nla_len(miss_acts));
 
-	/* Second nested attr is OVS_SOCK_TRY_ATTR_ACTIONS_ON_MISS. */
-	actions = nla_next(st_arg, &rem);
-
-	return clone_execute(dp, skb, key, 0, nla_data(actions),
-			     nla_len(actions), last, clone_flow_key);
+	return clone_execute(dp, skb, key, 0, nla_data(miss_acts),
+			     nla_len(miss_acts), last, clone_flow_key);
 }
 
 static struct sock *get_socket(struct net *net, __be32 saddr, __be16 sport,
@@ -1458,21 +1469,22 @@ static struct sock *get_socket(struct net *net, __be32 saddr, __be16 sport,
 		return NULL;
 
 	/* Advisory check - the sk_state could change, but we'll revalidate it
-	 * later on anyway*/
-	if (sk->sk_state != TCP_ESTABLISHED)
-		goto out_put;
-
-	if (ref)
-		sock_hold(sk);
-
-	sock_put(sk);
-	if (!ref)
+	 * later on anyway */
+	if (sk->sk_state != TCP_ESTABLISHED) {
+		sock_put(sk);
 		return NULL;
-	return sk;
+	}
 
-out_put:
-	sock_put(sk);
-	return NULL;
+	/* __inet_lookup_established returns a referenced socket.
+	 * When ref=true, keep it; the caller is responsible for sock_put.
+	 * When ref=false, release the reference and return the pointer as
+	 * an opaque comparison key (valid in BH context since the socket
+	 * is established and won't be freed until after BH completes).
+	 */
+	if (!ref)
+		sock_put(sk);
+
+	return sk;
 }
 
 static int execute_ovs_sk_map_metadata(struct sk_buff *skb,
@@ -1546,7 +1558,7 @@ static int execute_ovs_add_sock(struct datapath *dp, struct sk_buff *skb,
 		u32 ifindex;
 
 		ns = vport->dev->rtnl_link_ops->get_link_net(vport->dev);
-		ifindex = inet_sdif(skb);
+		ifindex = inet_iif(skb);
 		sock = get_socket(ns,
 				  key->ipv4.addr.src, key->tp.src,
 				  key->ipv4.addr.dst, htons(key->tp.dst),
@@ -1586,6 +1598,14 @@ static int execute_ovs_add_sock(struct datapath *dp, struct sk_buff *skb,
 		list_add_rcu(&node->list_node, &dp->sock_list);
 		spin_unlock_bh(&dp->sock_list_lock);
 		OVS_CB(skb)->sk_map_data = NULL;
+
+		{
+			struct ovs_net *ovs_net;
+
+			ovs_net = net_generic(ovs_dp_get_net(dp), ovs_net_id);
+			schedule_delayed_work(&ovs_net->dp_skmap_cleanup_work,
+					      msecs_to_jiffies(DP_SKMAP_CLEANUP_INTERVAL));
+		}
 	}
 
 	return 0;

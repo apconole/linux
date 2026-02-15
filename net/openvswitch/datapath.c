@@ -2617,13 +2617,21 @@ static void ovs_sock_list_probe(struct datapath *dp)
 static void ovs_dp_skmap_cleanup_wq(struct work_struct *work)
 {
 	struct ovs_net *ovs_net = container_of(work, struct ovs_net,
-					       dp_skmap_cleanup_work);
+					       dp_skmap_cleanup_work.work);
 	struct datapath *dp;
+	bool has_entries = false;
 
 	ovs_lock();
-	list_for_each_entry(dp, &ovs_net->dps, list_node)
+	list_for_each_entry(dp, &ovs_net->dps, list_node) {
 		ovs_sock_list_probe(dp);
+		if (!list_empty(&dp->sock_list))
+			has_entries = true;
+	}
 	ovs_unlock();
+
+	if (has_entries)
+		schedule_delayed_work(&ovs_net->dp_skmap_cleanup_work,
+				      msecs_to_jiffies(DP_SKMAP_CLEANUP_INTERVAL));
 }
 
 static const struct nla_policy vport_policy[OVS_VPORT_ATTR_MAX + 1] = {
@@ -2984,7 +2992,7 @@ static int __net_init ovs_init_net(struct net *net)
 
 	INIT_LIST_HEAD(&ovs_net->dps);
 	INIT_WORK(&ovs_net->dp_notify_work, ovs_dp_notify_wq);
-	INIT_WORK(&ovs_net->dp_skmap_cleanup_work, ovs_dp_skmap_cleanup_wq);
+	INIT_DELAYED_WORK(&ovs_net->dp_skmap_cleanup_work, ovs_dp_skmap_cleanup_wq);
 	INIT_DELAYED_WORK(&ovs_net->masks_rebalance, ovs_dp_masks_rebalance);
 
 	err = ovs_ct_init(net);
@@ -3049,7 +3057,7 @@ static void __net_exit ovs_exit_net(struct net *dnet)
 
 	cancel_delayed_work_sync(&ovs_net->masks_rebalance);
 	cancel_work_sync(&ovs_net->dp_notify_work);
-	cancel_work_sync(&ovs_net->dp_skmap_cleanup_work);
+	cancel_delayed_work_sync(&ovs_net->dp_skmap_cleanup_work);
 }
 
 static struct pernet_operations ovs_net_ops = {

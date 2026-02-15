@@ -46,6 +46,15 @@ OVS_FLOW_FAMILY = "ovs_flow"
 OVS_PACKET_FAMILY = "ovs_packet"
 OVS_METER_FAMILY = "ovs_meter"
 OVS_CT_LIMIT_FAMILY = "ovs_ct_limit"
+OVS_SKMAP_FAMILY = "ovs_skmap"
+
+OVS_SKMAP_VERSION = 1
+OVS_SKMAP_CMD_GET = 1
+OVS_SKMAP_CMD_DEL = 2
+
+OVS_SK_MAP_KEY_UNSET = 0
+OVS_SK_MAP_KEY_INPUT_SOCKET_BASED = 1
+OVS_SK_MAP_KEY_TUPLE_BASED = 2
 
 OVS_DATAPATH_VERSION = 2
 OVS_DP_CMD_NEW = 1
@@ -2528,6 +2537,85 @@ class OvsFlow(GenericNetlinkSocket):
         print("userspace action command", flush=True)
 
 
+class OvsSkmap(GenericNetlinkSocket):
+    class skmap_msg(ovs_dp_msg):
+        nla_map = (
+            ("OVS_SKMAP_ATTR_UNSPEC", "none"),
+            ("OVS_SKMAP_ATTR_KEY_TYPE", "uint32"),
+            ("OVS_SKMAP_ATTR_IPV4_SRC", "be32"),
+            ("OVS_SKMAP_ATTR_IPV4_DST", "be32"),
+            ("OVS_SKMAP_ATTR_TP_SRC", "be16"),
+            ("OVS_SKMAP_ATTR_TP_DST", "be16"),
+            ("OVS_SKMAP_ATTR_PROTOCOL", "uint8"),
+            ("OVS_SKMAP_ATTR_SOCK_STATE", "uint8"),
+            ("OVS_SKMAP_ATTR_PAD", "none"),
+        )
+
+        def dpstr(self):
+            key_type = self.get_attr("OVS_SKMAP_ATTR_KEY_TYPE")
+            if key_type == OVS_SK_MAP_KEY_TUPLE_BASED:
+                src = self.get_attr("OVS_SKMAP_ATTR_IPV4_SRC")
+                dst = self.get_attr("OVS_SKMAP_ATTR_IPV4_DST")
+                tp_src = self.get_attr("OVS_SKMAP_ATTR_TP_SRC")
+                tp_dst = self.get_attr("OVS_SKMAP_ATTR_TP_DST")
+                proto = self.get_attr("OVS_SKMAP_ATTR_PROTOCOL")
+                src_str = str(ipaddress.IPv4Address(src)) if src else "?"
+                dst_str = str(ipaddress.IPv4Address(dst)) if dst else "?"
+                s = "tuple(%s:%d->%s:%d,proto=%d)" % (
+                    src_str, tp_src or 0, dst_str, tp_dst or 0, proto or 0)
+            elif key_type == OVS_SK_MAP_KEY_INPUT_SOCKET_BASED:
+                s = "input_socket()"
+            else:
+                s = "unset()"
+
+            state = self.get_attr("OVS_SKMAP_ATTR_SOCK_STATE")
+            if state is not None:
+                s += ",state=%d" % state
+
+            return s
+
+    def __init__(self):
+        GenericNetlinkSocket.__init__(self)
+        self.bind(OVS_SKMAP_FAMILY, OvsSkmap.skmap_msg)
+
+    def dump(self, dpifindex):
+        msg = OvsSkmap.skmap_msg()
+        msg["cmd"] = OVS_SKMAP_CMD_GET
+        msg["version"] = OVS_SKMAP_VERSION
+        msg["reserved"] = 0
+        msg["dpifindex"] = dpifindex
+
+        try:
+            rep = self.nlm_request(
+                msg,
+                msg_type=self.prid,
+                msg_flags=NLM_F_REQUEST | NLM_F_ACK | NLM_F_DUMP,
+            )
+        except NetlinkError as ne:
+            raise ne
+        return rep
+
+    def delete(self, dpifindex, attrs):
+        msg = OvsSkmap.skmap_msg()
+        msg["cmd"] = OVS_SKMAP_CMD_DEL
+        msg["version"] = OVS_SKMAP_VERSION
+        msg["reserved"] = 0
+        msg["dpifindex"] = dpifindex
+        for k, v in attrs:
+            msg["attrs"].append([k, v])
+
+        try:
+            rep = self.nlm_request(
+                msg,
+                msg_type=self.prid,
+                msg_flags=NLM_F_REQUEST | NLM_F_ACK,
+            )
+            rep = rep[0]
+        except NetlinkError as ne:
+            raise ne
+        return rep
+
+
 class psample_sample(genlmsg):
     nla_map = (
         ("PSAMPLE_ATTR_IIFINDEX", "none"),
@@ -2728,6 +2816,9 @@ def main(argv):
     delfscmd = subparsers.add_parser("del-flows")
     delfscmd.add_argument("flsbr", help="Datapath name")
 
+    dumpskcmd = subparsers.add_parser("dump-skmaps")
+    dumpskcmd.add_argument("skmapdp", help="Datapath Name")
+
     subparsers.add_parser("psample-events")
 
     args = parser.parse_args()
@@ -2740,6 +2831,7 @@ def main(argv):
     ovsdp = OvsDatapath()
     ovsvp = OvsVport(ovspk)
     ovsflow = OvsFlow()
+    ovsskmap = OvsSkmap()
     ndb = NDB()
 
     sys.setrecursionlimit(100000)
@@ -2827,6 +2919,14 @@ def main(argv):
         if rep is None:
             print("DP '%s' not found." % args.flsbr)
         ovsflow.del_flows(rep["dpifindex"])
+    elif hasattr(args, "skmapdp"):
+        rep = ovsdp.info(args.skmapdp, 0)
+        if rep is None:
+            print("DP '%s' not found." % args.skmapdp)
+            return 1
+        entries = ovsskmap.dump(rep["dpifindex"])
+        for entry in entries:
+            print(entry.dpstr())
 
     return 0
 

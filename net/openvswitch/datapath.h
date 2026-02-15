@@ -22,6 +22,7 @@
 #include "vport-internal_dev.h"
 
 #define DP_MAX_PORTS                USHRT_MAX
+#define DP_SKMAP_CLEANUP_INTERVAL   5000
 #define DP_VPORT_HASH_BUCKETS       1024
 #define DP_MASKS_REBALANCE_INTERVAL 4000
 
@@ -222,7 +223,7 @@ struct dp_upcall_info {
 struct ovs_net {
 	struct list_head dps;
 	struct work_struct dp_notify_work;
-	struct work_struct dp_skmap_cleanup_work;
+	struct delayed_work dp_skmap_cleanup_work;
 	struct delayed_work masks_rebalance;
 #if	IS_ENABLED(CONFIG_NETFILTER_CONNCOUNT)
 	struct ovs_ct_limit_info *ct_limit_info;
