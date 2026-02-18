@@ -1257,7 +1257,7 @@ static int ovs_cmp_sock_md(struct ovs_skb_sk_map_data *key,
 	return (key && cmp && key->key_type == cmp->key_type &&
 		(key->key_type != OVS_SK_MAP_KEY_UNSET) &&
 		((key->key_type == OVS_SK_MAP_KEY_INPUT_SOCKET_BASED &&
-		  key->key.input_socket == cmp->key.input_socket) ||
+		  key->input_socket == cmp->input_socket) ||
 		 (key->key_type == OVS_SK_MAP_KEY_TUPLE_BASED &&
 		  key->key.tuple.ip.ipv4.src == cmp->key.tuple.ip.ipv4.src &&
 		  key->key.tuple.ip.ipv4.dst == cmp->key.tuple.ip.ipv4.dst &&
@@ -1499,7 +1499,7 @@ static int execute_ovs_sk_map_metadata(struct sk_buff *skb,
 	/* Never override the input socket mapping, as it is the
 	 * preferred key. */
 	if (skmd->key_type == OVS_SK_MAP_KEY_INPUT_SOCKET_BASED &&
-	    skmd->key.input_socket) {
+	    skmd->input_socket) {
 		return 0;
 	}
 
@@ -1522,12 +1522,13 @@ static int execute_ovs_sk_map_metadata(struct sk_buff *skb,
 				ifindex, false);
 		if (sk) {
 			skmd->key_type = OVS_SK_MAP_KEY_INPUT_SOCKET_BASED;
-			skmd->key.input_socket = sk;
-			return 0;
+			skmd->input_socket = sk;
+			goto tuple_fill;
 		}
 	}
 
 	skmd->key_type = OVS_SK_MAP_KEY_TUPLE_BASED;
+tuple_fill:
 	skmd->key.tuple.ip.ipv4.src = key->ipv4.addr.src;
 	skmd->key.tuple.ip.ipv4.dst = key->ipv4.addr.dst;
 	skmd->key.tuple.tp.src = key->tp.src;

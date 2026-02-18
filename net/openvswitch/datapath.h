@@ -83,8 +83,8 @@ enum ovs_sk_map_key_select {
  */
 struct ovs_skb_sk_map_data {
 	enum ovs_sk_map_key_select key_type;
+	struct sock *input_socket;
 	union {
-		struct sock *input_socket;
 		struct {
 			union {
 				struct {

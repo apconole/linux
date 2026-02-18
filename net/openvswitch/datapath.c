@@ -2706,20 +2706,20 @@ static int ovs_skmap_cmd_fill_info(struct dp_sk_mnode *entry, int dp_ifindex,
 	if (nla_put_u32(skb, OVS_SKMAP_ATTR_KEY_TYPE, entry->key.key_type))
 		goto nla_put_failure;
 
-	if (entry->key.key_type == OVS_SK_MAP_KEY_TUPLE_BASED) {
-		if (nla_put_be32(skb, OVS_SKMAP_ATTR_IPV4_SRC,
-				 entry->key.key.tuple.ip.ipv4.src) ||
-		    nla_put_be32(skb, OVS_SKMAP_ATTR_IPV4_DST,
-				 entry->key.key.tuple.ip.ipv4.dst) ||
-		    nla_put_be16(skb, OVS_SKMAP_ATTR_TP_SRC,
-				 entry->key.key.tuple.tp.src) ||
-		    nla_put_be16(skb, OVS_SKMAP_ATTR_TP_DST,
-				 entry->key.key.tuple.tp.dst) ||
-		    nla_put_u8(skb, OVS_SKMAP_ATTR_PROTOCOL,
-			       entry->key.key.tuple.protocol))
-			goto nla_put_failure;
-	}
+	/* Tuple details are always filled. */
+	if (nla_put_be32(skb, OVS_SKMAP_ATTR_IPV4_SRC,
+			 entry->key.key.tuple.ip.ipv4.src) ||
+	    nla_put_be32(skb, OVS_SKMAP_ATTR_IPV4_DST,
+			 entry->key.key.tuple.ip.ipv4.dst) ||
+	    nla_put_be16(skb, OVS_SKMAP_ATTR_TP_SRC,
+			 entry->key.key.tuple.tp.src) ||
+	    nla_put_be16(skb, OVS_SKMAP_ATTR_TP_DST,
+			 entry->key.key.tuple.tp.dst) ||
+	    nla_put_u8(skb, OVS_SKMAP_ATTR_PROTOCOL,
+		       entry->key.key.tuple.protocol))
+	  goto nla_put_failure;
 
+	pr_err("pushed sport: %d", entry->key.key.tuple.tp.src);
 	sk = rcu_dereference(entry->output_sock);
 	if (sk) {
 		sock_state = sk->sk_state;

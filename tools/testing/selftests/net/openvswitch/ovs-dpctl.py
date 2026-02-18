@@ -2553,18 +2553,20 @@ class OvsSkmap(GenericNetlinkSocket):
 
         def dpstr(self):
             key_type = self.get_attr("OVS_SKMAP_ATTR_KEY_TYPE")
+            src = self.get_attr("OVS_SKMAP_ATTR_IPV4_SRC")
+            dst = self.get_attr("OVS_SKMAP_ATTR_IPV4_DST")
+            tp_src = self.get_attr("OVS_SKMAP_ATTR_TP_SRC")
+            tp_dst = self.get_attr("OVS_SKMAP_ATTR_TP_DST")
+            proto = self.get_attr("OVS_SKMAP_ATTR_PROTOCOL")
+            src_str = str(ipaddress.IPv4Address(src)) if src else "?"
+            dst_str = str(ipaddress.IPv4Address(dst)) if dst else "?"
+
             if key_type == OVS_SK_MAP_KEY_TUPLE_BASED:
-                src = self.get_attr("OVS_SKMAP_ATTR_IPV4_SRC")
-                dst = self.get_attr("OVS_SKMAP_ATTR_IPV4_DST")
-                tp_src = self.get_attr("OVS_SKMAP_ATTR_TP_SRC")
-                tp_dst = self.get_attr("OVS_SKMAP_ATTR_TP_DST")
-                proto = self.get_attr("OVS_SKMAP_ATTR_PROTOCOL")
-                src_str = str(ipaddress.IPv4Address(src)) if src else "?"
-                dst_str = str(ipaddress.IPv4Address(dst)) if dst else "?"
                 s = "tuple(%s:%d->%s:%d,proto=%d)" % (
                     src_str, tp_src or 0, dst_str, tp_dst or 0, proto or 0)
             elif key_type == OVS_SK_MAP_KEY_INPUT_SOCKET_BASED:
-                s = "input_socket()"
+                s = "input_socket(%s:%d->%s:%d,proto=%d)" % (
+                    src_str, tp_src or 0, dst_str, tp_dst or 0, proto or 0)
             else:
                 s = "unset()"
 
