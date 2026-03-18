@@ -1414,6 +1414,7 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 			}
 
 			if (!last) {
+				struct sw_flow *sock_flow;
 				struct sk_buff *nskb = skb_clone(skb, GFP_ATOMIC);
 
 				if (!nskb) {
@@ -1426,17 +1427,38 @@ static int execute_sock_try(struct datapath *dp, struct sk_buff *skb,
 					rcu_read_unlock_bh();
 					goto miss;
 				}
+				/* skb (original) is still valid; use it for stats
+				 * since nskb (the clone) may have been consumed.
+				 */
+				sock_flow = rcu_dereference(n->flow);
+				if (sock_flow)
+					ovs_flow_stats_update(sock_flow,
+							      key->tp.flags,
+							      skb);
 				rcu_read_unlock_bh();
 				return ret;
 			}
 
-			ret = enqueue_skb_to_tcp_socket(sk, skb);
-			if (ret == -EAGAIN) {
+			{
+				struct sw_flow *sock_flow;
+
+				/* Update flow stats before enqueue: on the last
+				 * action, skb may be consumed by the TCP stack
+				 * on success and must not be accessed afterwards.
+				 */
+				sock_flow = rcu_dereference(n->flow);
+				if (sock_flow)
+					ovs_flow_stats_update(sock_flow,
+							      key->tp.flags,
+							      skb);
+				ret = enqueue_skb_to_tcp_socket(sk, skb);
+				if (ret == -EAGAIN) {
+					rcu_read_unlock_bh();
+					goto miss;
+				}
 				rcu_read_unlock_bh();
-				goto miss;
+				return ret;
 			}
-			rcu_read_unlock_bh();
-			return ret;
 		}
 	}
 	rcu_read_unlock_bh();
@@ -1595,6 +1617,20 @@ static int execute_ovs_add_sock(struct datapath *dp, struct sk_buff *skb,
 
 		node->key = *OVS_CB(skb)->sk_map_data;
 		rcu_assign_pointer(node->output_sock, sock);
+		/* Look up the current flow so the entry can be evicted when
+		 * the flow is removed.  We are already under RCU read lock
+		 * (the caller holds rcu_read_lock throughout action execution).
+		 */
+		{
+			u32 n_mask_hit, n_cache_hit;
+			struct sw_flow *cur_flow;
+
+			cur_flow = ovs_flow_tbl_lookup_stats(&dp->table, key,
+							     skb_get_hash(skb),
+							     &n_mask_hit,
+							     &n_cache_hit);
+			rcu_assign_pointer(node->flow, cur_flow);
+		}
 		spin_lock_bh(&dp->sock_list_lock);
 		list_add_rcu(&node->list_node, &dp->sock_list);
 		spin_unlock_bh(&dp->sock_list_lock);

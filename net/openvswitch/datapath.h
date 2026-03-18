@@ -110,7 +110,8 @@ struct dp_sk_mnode {
 	struct list_head		list_node;
 	struct rcu_head			rcu;
 	struct ovs_skb_sk_map_data	key;
-	struct sock			*output_sock;
+	struct sock __rcu		*output_sock;
+	struct sw_flow __rcu		*flow;    /* Associated flow; NULL if flow deleted */
 };
 
 /**

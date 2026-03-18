@@ -176,6 +176,38 @@ static void free_sock_map_entry(struct rcu_head *rcu)
 	kfree(entry);
 }
 
+/* Remove all socket map entries from @dp.  Must be called with ovs_mutex. */
+static void ovs_dp_sockmap_flush_all(struct datapath *dp)
+{
+	struct dp_sk_mnode *cur, *n;
+
+	spin_lock_bh(&dp->sock_list_lock);
+	list_for_each_entry_safe(cur, n, &dp->sock_list, list_node) {
+		list_del_rcu(&cur->list_node);
+		call_rcu(&cur->rcu, free_sock_map_entry);
+	}
+	spin_unlock_bh(&dp->sock_list_lock);
+}
+
+/* Remove all socket map entries associated with @flow.
+ * Must be called with ovs_mutex and after the flow has been removed from the
+ * flow table, so that no new ADD_SOCK actions can install new entries for it.
+ */
+static void ovs_dp_sockmap_remove_flow(struct datapath *dp,
+				       const struct sw_flow *flow)
+{
+	struct dp_sk_mnode *cur, *n;
+
+	spin_lock_bh(&dp->sock_list_lock);
+	list_for_each_entry_safe(cur, n, &dp->sock_list, list_node) {
+		if (rcu_access_pointer(cur->flow) == flow) {
+			list_del_rcu(&cur->list_node);
+			call_rcu(&cur->rcu, free_sock_map_entry);
+		}
+	}
+	spin_unlock_bh(&dp->sock_list_lock);
+}
+
 static void destroy_dp_rcu(struct rcu_head *rcu)
 {
 	struct datapath *dp = container_of(rcu, struct datapath, rcu);
@@ -1451,6 +1483,8 @@ static int ovs_flow_cmd_del(struct sk_buff *skb, struct genl_info *info)
 
 	if (unlikely(!a[OVS_FLOW_ATTR_KEY] && !ufid_present)) {
 		err = ovs_flow_tbl_flush(&dp->table);
+		if (!err)
+			ovs_dp_sockmap_flush_all(dp);
 		goto unlock;
 	}
 
@@ -1464,6 +1498,7 @@ static int ovs_flow_cmd_del(struct sk_buff *skb, struct genl_info *info)
 	}
 
 	ovs_flow_tbl_remove(&dp->table, flow);
+	ovs_dp_sockmap_remove_flow(dp, flow);
 	ovs_unlock();
 
 	reply = ovs_flow_cmd_alloc_info((const struct sw_flow_actions __force *) flow->sf_acts,
@@ -1940,7 +1975,6 @@ err:
 static void __dp_destroy(struct datapath *dp)
 {
 	struct flow_table *table = &dp->table;
-	struct dp_sk_mnode *cur, *n;
 	int i;
 
 	if (dp->user_features & OVS_DP_F_TC_RECIRC_SHARING)
@@ -1970,12 +2004,7 @@ static void __dp_destroy(struct datapath *dp)
 				  ovsl_dereference(table->ufid_ti));
 
 	/* Flush the socket list for this DP */
-	spin_lock_bh(&dp->sock_list_lock);
-	list_for_each_entry_safe(cur, n, &dp->sock_list, list_node) {
-		list_del_rcu(&cur->list_node);
-		call_rcu(&cur->rcu, free_sock_map_entry);
-	}
-	spin_unlock_bh(&dp->sock_list_lock);
+	ovs_dp_sockmap_flush_all(dp);
 
 	/* RCU destroy the ports, meters and flow tables. */
 	call_rcu(&dp->rcu, destroy_dp_rcu);
